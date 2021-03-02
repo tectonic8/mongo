@@ -73,9 +73,11 @@ void AccumulatorSum::processInternal(const Value& input, bool merging) {
     // Upgrade to the widest type required to hold the result.
     totalType = Value::getWidestNumeric(totalType, input.getType());
     switch (input.getType()) {
-        case NumberInt:
         case NumberLong:
-            nonDecimalTotal.addLong(input.coerceToLong());
+            nonDecimalTotal.addLong(input.getLong());
+            break;
+        case NumberInt:
+            nonDecimalTotal.addInt(input.getInt());
             break;
         case NumberDouble:
             nonDecimalTotal.addDouble(input.getDouble());
@@ -122,6 +124,9 @@ Value AccumulatorSum::getValue(bool toBeMerged) {
         case NumberDouble:
             return Value(nonDecimalTotal.getDouble());
         case NumberDecimal: {
+            if (decimalTotal.isZero()) {
+                return Value(nonDecimalTotal.getDouble());
+            }
             return Value(decimalTotal.add(nonDecimalTotal.getDecimal()));
         }
         default:

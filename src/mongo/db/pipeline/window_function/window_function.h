@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <cmath>
+
 #include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression.h"
@@ -51,7 +53,6 @@ public:
     virtual Value getValue() const = 0;
     virtual void reset() = 0;
 };
-
 
 template <AccumulatorMinMax::Sense sense>
 class WindowFunctionMinMax : public WindowFunctionState {
@@ -102,4 +103,178 @@ protected:
 using WindowFunctionMin = WindowFunctionMinMax<AccumulatorMinMax::Sense::kMin>;
 using WindowFunctionMax = WindowFunctionMinMax<AccumulatorMinMax::Sense::kMax>;
 
+class RemovableSum : public WindowFunctionState {
+protected:
+    explicit RemovableSum(ExpressionContext* const expCtx)
+        : _sumAcc(AccumulatorSum::create(expCtx)),
+          _posInfiniteValueCount(0),
+          _negInfiniteValueCount(0),
+          _nanCount(0),
+          _doubleCount(0),
+          _decimalCount(0) {}
+
+public:
+    static Value getDefault() {
+        return Value{0};
+    }
+
+    void add(Value value) override {
+        update(std::move(value), 1);
+    }
+
+    void remove(Value value) override {
+        update(std::move(value), -1);
+    }
+
+    Value getValue() const override {
+        if (_nanCount > 0) {
+            return _decimalCount > 0 ? Value(Decimal128::kPositiveNaN)
+                                     : Value(std::numeric_limits<double>::quiet_NaN());
+        }
+        if (_posInfiniteValueCount > 0 && _negInfiniteValueCount > 0) {
+            return _decimalCount > 0 ? Value(Decimal128::kPositiveNaN)
+                                     : Value(std::numeric_limits<double>::quiet_NaN());
+        }
+        if (_posInfiniteValueCount > 0) {
+            return _decimalCount > 0 ? Value(Decimal128::kPositiveInfinity)
+                                     : Value(std::numeric_limits<double>::infinity());
+        }
+        if (_negInfiniteValueCount > 0) {
+            return _decimalCount > 0 ? Value(Decimal128::kNegativeInfinity)
+                                     : Value(-std::numeric_limits<double>::infinity());
+        }
+        Value val = _sumAcc->getValue(false);
+        if (val.getType() == NumberDouble && _doubleCount == 0 &&
+            val.getDouble() > std::numeric_limits<long long>::min() &&
+            val.getDouble() < std::numeric_limits<long long>::max()) {
+            return Value::createIntOrLong(llround(val.getDouble()));
+        }
+        return _sumAcc->getValue(false);
+    }
+
+private:
+    boost::intrusive_ptr<AccumulatorState> _sumAcc;
+    int _posInfiniteValueCount;
+    int _negInfiniteValueCount;
+    int _nanCount;
+    long long _doubleCount;
+    long long _decimalCount;
+
+    template <class T>
+    void accountForIntegral(T value, int quantity) {
+        if (value == std::numeric_limits<T>::min() && quantity == -1) {
+            // Avoid overflow by processing in two parts.
+            _sumAcc->process(Value(std::numeric_limits<T>::max()), false);
+            _sumAcc->process(Value(1), false);
+        } else {
+            _sumAcc->process(Value(value * quantity), false);
+        }
+    }
+
+    void accountForDouble(double value, int quantity) {
+        // quantity should be 1 if adding value, -1 if removing value
+        if (std::isnan(value)) {
+            _nanCount += quantity;
+        } else if (value == std::numeric_limits<double>::infinity()) {
+            _posInfiniteValueCount += quantity;
+        } else if (value == -std::numeric_limits<double>::infinity()) {
+            _negInfiniteValueCount += quantity;
+        } else {
+            _sumAcc->process(Value(value * quantity), false);
+        }
+    }
+
+    void accountForDecimal(Decimal128 value, int quantity) {
+        // quantity should be 1 if adding value, -1 if removing value
+        if (value.isNaN()) {
+            _nanCount += quantity;
+        } else if (value.isInfinite() && !value.isNegative()) {
+            _posInfiniteValueCount += quantity;
+        } else if (value.isInfinite() && value.isNegative()) {
+            _negInfiniteValueCount += quantity;
+        } else {
+            if (quantity == -1) {
+                value = value.negate();
+            }
+            _sumAcc->process(Value(value), false);
+        }
+    }
+
+    void update(Value value, int quantity) {
+        // quantity should be 1 if adding value, -1 if removing value
+        switch (value.getType()) {
+            case NumberInt:
+                accountForIntegral(value.getInt(), quantity);
+                break;
+            case NumberLong:
+                accountForIntegral(value.getLong(), quantity);
+                break;
+            case NumberDouble:
+                _doubleCount += quantity;
+                accountForDouble(value.getDouble(), quantity);
+                break;
+            case NumberDecimal:
+                _decimalCount += quantity;
+                accountForDecimal(value.getDecimal(), quantity);
+                break;
+            default:
+                MONGO_UNREACHABLE_TASSERT(5371300);
+        }
+    }
+};
+
+class WindowFunctionSum final : public RemovableSum {
+public:
+    explicit WindowFunctionSum(ExpressionContext* const expCtx) : RemovableSum(expCtx) {}
+};
+
+class WindowFunctionAvg final : public RemovableSum {
+public:
+    explicit WindowFunctionAvg(ExpressionContext* const expCtx) : RemovableSum(expCtx), _count(0) {}
+
+    static Value getDefault() {
+        return Value(BSONNULL);
+    }
+
+    void add(Value value) final {
+        RemovableSum::add(std::move(value));
+        _count++;
+    }
+
+    void remove(Value value) final {
+        RemovableSum::remove(std::move(value));
+        _count--;
+    }
+
+    Value getValue() const final {
+        if (_count == 0) {
+            return getDefault();
+        }
+        Value sum = RemovableSum::getValue();
+        switch (sum.getType()) {
+            case NumberInt:
+            case NumberLong:
+                return Value(sum.coerceToDouble() / static_cast<double>(_count));
+            case NumberDouble: {
+                double internalSum = sum.getDouble();
+                if (std::isnan(internalSum) || std::isinf(internalSum)) {
+                    return sum;
+                }
+                return Value(internalSum / static_cast<double>(_count));
+            }
+            case NumberDecimal: {
+                Decimal128 internalSum = sum.getDecimal();
+                if (internalSum.isNaN() || internalSum.isInfinite()) {
+                    return sum;
+                }
+                return Value(internalSum.divide(Decimal128(_count)));
+            }
+            default:
+                MONGO_UNREACHABLE_TASSERT(5371301);
+        }
+    }
+
+private:
+    long long _count;
+};
 }  // namespace mongo

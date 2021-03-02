@@ -85,6 +85,8 @@ void AccumulatorAvg::processInternal(const Value& input, bool merging) {
             _nonDecimalTotal.addLong(input.getLong());
             break;
         case NumberInt:
+            _nonDecimalTotal.addInt(input.getInt());
+            break;
         case NumberDouble:
             _nonDecimalTotal.addDouble(input.getDouble());
             break;
