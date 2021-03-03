@@ -124,9 +124,6 @@ Value AccumulatorSum::getValue(bool toBeMerged) {
         case NumberDouble:
             return Value(nonDecimalTotal.getDouble());
         case NumberDecimal: {
-            if (decimalTotal.isZero()) {
-                return Value(nonDecimalTotal.getDouble());
-            }
             return Value(decimalTotal.add(nonDecimalTotal.getDecimal()));
         }
         default:

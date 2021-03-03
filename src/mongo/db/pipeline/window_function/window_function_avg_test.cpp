@@ -111,10 +111,10 @@ TEST_F(WindowFunctionAvgTest, HandleNaNs) {
     avg.add(Value{1});
     avg.add(nan);
     ASSERT_VALUE_EQ(avg.getValue(), nan);
-    avg.add(Value(3));
+    avg.add(Value{3});
     ASSERT_VALUE_EQ(avg.getValue(), nan);
     avg.remove(nan);
-    ASSERT_VALUE_EQ(avg.getValue(), Value(2));
+    ASSERT_VALUE_EQ(avg.getValue(), Value{2});
     // We are not preserving the exact type of NaN.
     avg.add(Value(Decimal128::kNegativeNaN));
     ASSERT_VALUE_EQ(avg.getValue(), Value(Decimal128::kPositiveNaN));

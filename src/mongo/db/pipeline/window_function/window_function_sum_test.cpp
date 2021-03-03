@@ -48,7 +48,7 @@ TEST_F(WindowFunctionSumTest, EmptyWindow) {
     ASSERT_VALUE_EQ(sum.getValue(), Value{0});
 }
 
-TEST_F(WindowFunctionSumTest, NarrowestType) {
+TEST_F(WindowFunctionSumTest, NarrowestType1) {
     sum.add(Value{1});
     ASSERT_EQUALS(sum.getValue().getType(), NumberInt);
 
@@ -60,7 +60,7 @@ TEST_F(WindowFunctionSumTest, NarrowestType) {
     sum.remove(Value(std::numeric_limits<double>::infinity()));
     ASSERT_EQUALS(sum.getValue().getType(), NumberInt);
 
-    sum.add(Value(2147483647));
+    sum.add(Value{2147483647});
     ASSERT_EQUALS(sum.getValue().getType(), NumberLong);
     sum.add(Value{1.5});
     ASSERT_EQUALS(sum.getValue().getType(), NumberDouble);
@@ -72,9 +72,34 @@ TEST_F(WindowFunctionSumTest, NarrowestType) {
     sum.remove(Value{1.5});
     ASSERT_EQUALS(sum.getValue().getType(), NumberLong);
     // Returned type narrows to int if the value fits.
-    sum.remove(Value(1));
+    sum.remove(Value{1});
     ASSERT_EQUALS(sum.getValue().getType(), NumberInt);
     // Returned type is double if sum overflows long.
+    sum.add(Value(std::numeric_limits<long long>::max()));
+    ASSERT_EQUALS(sum.getValue().getType(), NumberDouble);
+}
+
+TEST_F(WindowFunctionSumTest, NarrowestType2) {
+    // This test is separate because narrowing a double goes through a different code path if a
+    // Decimal128 was never added.
+    sum.add(Value{1});
+    sum.add(Value{1.5});
+    sum.add(Value{2147483647});
+    ASSERT_EQUALS(sum.getValue().getType(), NumberDouble);
+    sum.remove(Value{1.5});
+    ASSERT_EQUALS(sum.getValue().getType(), NumberLong);
+    sum.remove(Value{1});
+    ASSERT_EQUALS(sum.getValue().getType(), NumberInt);
+    sum.add(Value(std::numeric_limits<long long>::max()));
+    ASSERT_EQUALS(sum.getValue().getType(), NumberDouble);
+}
+
+TEST_F(WindowFunctionSumTest, NarrowestType3) {
+    // Test narrowing a long when neither Decimal128 nor double were added.
+    sum.add(Value{2147483648ll});
+    ASSERT_EQUALS(sum.getValue().getType(), NumberLong);
+    sum.remove(Value{1});
+    ASSERT_EQUALS(sum.getValue().getType(), NumberInt);
     sum.add(Value(std::numeric_limits<long long>::max()));
     ASSERT_EQUALS(sum.getValue().getType(), NumberDouble);
 }

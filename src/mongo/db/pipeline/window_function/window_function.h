@@ -144,12 +144,35 @@ public:
                                      : Value(-std::numeric_limits<double>::infinity());
         }
         Value val = _sumAcc->getValue(false);
+        if (val.getType() == NumberDecimal && _decimalCount == 0) {
+            Decimal128 decVal = val.getDecimal();
+            if (_doubleCount > 0) {  // Narrow Decimal128 to double.
+                return Value(decVal.toDouble());
+            }
+            std::uint32_t signalingFlags = Decimal128::SignalingFlag::kNoFlag;
+            long long longVal = decVal.toLong(&signalingFlags);  // Narrow Decimal128 to integral.
+            if (signalingFlags == Decimal128::SignalingFlag::kNoFlag) {
+                return Value::createIntOrLong(longVal);
+            }
+            return Value(decVal.toDouble());  // Narrow Decimal128 to double if overflows long.
+        }
         if (val.getType() == NumberDouble && _doubleCount == 0 &&
             val.getDouble() > std::numeric_limits<long long>::min() &&
-            val.getDouble() < std::numeric_limits<long long>::max()) {
+            val.getDouble() < std::numeric_limits<long long>::max()) {  // Narrow double to integral
             return Value::createIntOrLong(llround(val.getDouble()));
         }
-        return _sumAcc->getValue(false);
+        if (val.getType() == NumberLong) {  // Narrow long to int
+            return Value::createIntOrLong(val.getLong());
+        }
+        return val;
+    }
+
+    void reset() {
+        _posInfiniteValueCount = 0;
+        _negInfiniteValueCount = 0;
+        _nanCount = 0;
+        _doubleCount = 0;
+        _decimalCount = 0;
     }
 
 private:
@@ -272,6 +295,11 @@ public:
             default:
                 MONGO_UNREACHABLE_TASSERT(5371301);
         }
+    }
+
+    void reset() {
+        RemovableSum::reset();
+        _count = 0;
     }
 
 private:
