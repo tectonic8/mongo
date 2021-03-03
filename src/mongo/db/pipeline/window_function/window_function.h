@@ -168,6 +168,7 @@ public:
     }
 
     void reset() {
+        _sumAcc.reset();
         _posInfiniteValueCount = 0;
         _negInfiniteValueCount = 0;
         _nanCount = 0;
