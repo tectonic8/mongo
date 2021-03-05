@@ -140,6 +140,8 @@ public:
     static constexpr StringData kExclude = "exclude"_sd;
     static constexpr StringData kTimeFieldName = "timeField"_sd;
     static constexpr StringData kMetaFieldName = "metaField"_sd;
+    static constexpr StringData kControlMaxFieldName = "control.max."_sd;
+    static constexpr StringData kControlMinFieldName = "control.min."_sd;
 
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx);
@@ -181,14 +183,46 @@ public:
                                                      Pipeline::SourceContainer* container) final;
 
     /*
-     * Given a source container and an iterator pointing to the unpack stage, attempt to internalize
-     * a following $project, and update the state for 'container' and '_bucketUnpacker'.
+     * Given a $project produced by 'extractOrBuildProjectToInternalize()', attempt to internalize
+     * its top-level fields by updating the state of '_bucketUnpacker'.
      */
-    void internalizeProject(Pipeline::SourceContainer::iterator itr,
-                            Pipeline::SourceContainer* container);
+    void internalizeProject(const BSONObj& project, bool isInclusion);
 
-    BSONObj buildProjectToInternalize(Pipeline::SourceContainer::iterator itr,
-                                      Pipeline::SourceContainer* container) const;
+    /**
+     * Given a SourceContainer and an iterator pointing to $_internalUnpackBucket, extracts or
+     * builds a $project that can be entirely internalized according to the below rules. Returns the
+     * $project and a bool indicating its type (true for inclusion, false for exclusion).
+     *    1. If there is an inclusion projection immediately after $_internalUnpackBucket which can
+     *       be internalized, it will be removed from the pipeline and returned.
+     *    2. Otherwise, if there is a finite dependency set for the rest of the pipeline, an
+     *       inclusion $project representing it and containing only root-level fields will be
+     *       returned. An inclusion $project will be returned here even if there is a viable
+     *       exclusion $project next in the pipeline.
+     *    3. Otherwise, if there is an exclusion projection immediately after $_internalUnpackBucket
+     *       which can be internalized, it will be removed from the pipeline and returned.
+     *    3. Otherwise, an empty BSONObj will be returned.
+     */
+    std::pair<BSONObj, bool> extractOrBuildProjectToInternalize(
+        Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) const;
+
+    /**
+     * Takes a predicate after $_internalUnpackBucket on a bucketed field as an argument and
+     * attempts to map it to a new predicate on the 'control' field. For example, the predicate
+     * {a: {$gt: 5}} will generate the predicate {control.max.a: {$_internalExprGt: 5}}, which will
+     * be added before the $_internalUnpackBucket stage.
+     *
+     * If the original predicate is on the bucket's timeField we may also create a new predicate
+     * on the '_id' field to assist in index utilization. For example, the predicate
+     * {time: {$lt: new Date(...)}} will generate the following predicate:
+     * {$and: [
+     *      {_id: {$lt: ObjectId(...)}},
+     *      {control.min.time: {$_internalExprLt: new Date(...)}}
+     * ]}
+     *
+     * If the provided predicate is ineligible for this mapping, the function will return a nullptr.
+     */
+    std::unique_ptr<MatchExpression> createPredicatesOnBucketLevelField(
+        const MatchExpression* matchExpr) const;
 
 private:
     GetNextResult doGetNext() final;

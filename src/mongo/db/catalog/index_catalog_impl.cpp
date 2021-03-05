@@ -137,7 +137,7 @@ Status IndexCatalogImpl::init(OperationContext* opCtx) {
         auto descriptor = std::make_unique<IndexDescriptor>(_getAccessMethodName(keyPattern), spec);
         if (spec.hasField(IndexDescriptor::kExpireAfterSecondsFieldName)) {
             TTLCollectionCache::get(opCtx->getServiceContext())
-                .registerTTLInfo(std::make_pair(_collection->uuid(), indexName));
+                .registerTTLInfo(_collection->uuid(), indexName);
         }
 
         bool ready = durableCatalog->isIndexReady(opCtx, _collection->getCatalogId(), indexName);
@@ -451,8 +451,10 @@ IndexCatalogEntry* IndexCatalogImpl::createIndexEntry(OperationContext* opCtx,
         opCtx, _collection->getCatalogId(), ident, std::move(descriptor), frozen);
 
     IndexDescriptor* desc = entry->descriptor();
+    auto collOptions =
+        DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, _collection->getCatalogId());
     std::unique_ptr<SortedDataInterface> sdi =
-        engine->getEngine()->getSortedDataInterface(opCtx, ident, desc);
+        engine->getEngine()->getSortedDataInterface(opCtx, collOptions, ident, desc);
 
     std::unique_ptr<IndexAccessMethod> accessMethod =
         IndexAccessMethodFactory::get(opCtx)->make(entry.get(), std::move(sdi));
@@ -518,6 +520,8 @@ StatusWith<BSONObj> IndexCatalogImpl::createIndexOnEmptyCollection(OperationCont
     // sanity check
     invariant(DurableCatalog::get(opCtx)->isIndexReady(
         opCtx, _collection->getCatalogId(), descriptor->indexName()));
+
+    audit::logCreateIndex(opCtx->getClient(), &spec, descriptor->indexName(), _collection->ns());
 
     return spec;
 }
@@ -739,11 +743,22 @@ Status IndexCatalogImpl::_isSpecOk(OperationContext* opCtx, const BSONObj& spec)
         }
     }
 
+    uassert(ErrorCodes::InvalidOptions,
+            "Partial indexes are not supported on collections clustered by _id",
+            !_collection->isClustered() || !spec[IndexDescriptor::kPartialFilterExprFieldName]);
+
+    uassert(ErrorCodes::InvalidOptions,
+            "Unique indexes are not supported on collections clustered by _id",
+            !_collection->isClustered() || !spec[IndexDescriptor::kUniqueFieldName].trueValue());
+
+    uassert(ErrorCodes::InvalidOptions,
+            "TTL indexes are not supported on collections clustered by _id",
+            !_collection->isClustered() || !spec[IndexDescriptor::kExpireAfterSecondsFieldName]);
+
     if (IndexDescriptor::isIdIndexPattern(key)) {
-        if (nss.isTimeseriesBucketsCollection()) {
-            // Time-series collections have a clustered index on _id.
+        if (_collection->isClustered()) {
             return Status(ErrorCodes::CannotCreateIndex,
-                          "cannot have an _id index on a time-series bucket collection");
+                          "cannot create an _id index on a collection already clustered by _id");
         }
 
         BSONElement uniqueElt = spec["unique"];
@@ -1066,7 +1081,7 @@ Status IndexCatalogImpl::dropIndexEntry(OperationContext* opCtx, IndexCatalogEnt
     // Pulling indexName out as it is needed post descriptor release.
     string indexName = entry->descriptor()->indexName();
 
-    audit::logDropIndex(&cc(), indexName, _collection->ns().ns());
+    audit::logDropIndex(&cc(), indexName, _collection->ns());
 
     auto released = _readyIndexes.release(entry->descriptor());
     if (released) {

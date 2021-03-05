@@ -96,6 +96,7 @@ public:
     StringData getServiceName() const override {
         return kReshardingCoordinatorServiceName;
     }
+
     NamespaceString getStateDocumentsNS() const override {
         return NamespaceString::kConfigReshardingOperationsNamespace;
     }
@@ -104,8 +105,13 @@ public:
         // TODO Limit the size of ReshardingCoordinatorService thread pool.
         return ThreadPool::Limits();
     }
+
     std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(
         BSONObj initialState) const override;
+
+private:
+    ExecutorFuture<void> _rebuildService(std::shared_ptr<executor::ScopedTaskExecutor> executor,
+                                         const CancelationToken& token) override;
 };
 
 class ReshardingCoordinatorService::ReshardingCoordinator final
@@ -182,7 +188,7 @@ private:
 
     /**
      * Waits on _reshardingCoordinatorObserver to notify that all recipients have finished
-     * applying oplog entries. Transitions to 'kMirroring'.
+     * applying oplog entries. Transitions to 'kBlockingWrites'.
      */
     ExecutorFuture<void> _awaitAllRecipientsFinishedApplying(
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
@@ -224,6 +230,7 @@ private:
         CoordinatorStateEnum nextState,
         ReshardingCoordinatorDocument coordinatorDoc,
         boost::optional<Timestamp> fetchTimestamp = boost::none,
+        boost::optional<ReshardingApproxCopySize> approxCopySize = boost::none,
         boost::optional<Status> abortReason = boost::none);
 
     /**
@@ -246,7 +253,7 @@ private:
      * participant shards.
      */
     void _tellAllParticipantsToRefresh(
-        const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
+        const BSONObj& refreshCmd, const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
 
     // The unique key for a given resharding operation. InstanceID is an alias for BSONObj. The
     // value of this is the UUID that will be used as the collection UUID for the new sharded

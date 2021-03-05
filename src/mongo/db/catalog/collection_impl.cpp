@@ -70,6 +70,7 @@
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/key_string.h"
 #include "mongo/db/storage/record_store.h"
+#include "mongo/db/ttl_collection_cache.h"
 #include "mongo/db/update/update_driver.h"
 
 #include "mongo/db/auth/user_document_parser.h"  // XXX-ANDY
@@ -330,8 +331,22 @@ void CollectionImpl::init(OperationContext* opCtx) {
     }
 
     if (collectionOptions.clusteredIndex) {
-        invariant(_shared->_recordStore->keyFormat() == KeyFormat::String);
         _clustered = true;
+        if (collectionOptions.clusteredIndex->getExpireAfterSeconds()) {
+            // If this collection has been newly created, we need to register with the TTL cache at
+            // commit time, otherwise it is startup and we can register immediately.
+            auto svcCtx = opCtx->getClient()->getServiceContext();
+            auto uuid = *collectionOptions.uuid;
+            if (opCtx->lockState()->inAWriteUnitOfWork()) {
+                opCtx->recoveryUnit()->onCommit([svcCtx, uuid](auto ts) {
+                    TTLCollectionCache::get(svcCtx).registerTTLInfo(
+                        uuid, TTLCollectionCache::ClusteredId{});
+                });
+            } else {
+                TTLCollectionCache::get(svcCtx).registerTTLInfo(uuid,
+                                                                TTLCollectionCache::ClusteredId{});
+            }
+        }
     }
 
     getIndexCatalog()->init(opCtx).transitional_ignore();
@@ -364,8 +379,8 @@ bool CollectionImpl::requiresIdIndex() const {
         return false;
     }
 
-    if (_ns.isTimeseriesBucketsCollection()) {
-        // Time-series bucket collections have a clustered _id index.
+    if (isClustered()) {
+        // Collections clustered by _id do not have a separate _id index.
         return false;
     }
 
@@ -395,6 +410,25 @@ bool CollectionImpl::findDoc(OperationContext* opCtx,
     return true;
 }
 
+Status CollectionImpl::checkValidatorAPIVersionCompatability(OperationContext* opCtx) const {
+    if (!_validator.expCtxForFilter) {
+        return Status::OK();
+    }
+    const auto& apiParams = APIParameters::get(opCtx);
+    const auto apiVersion = apiParams.getAPIVersion().value_or("");
+    if (apiParams.getAPIStrict().value_or(false) && apiVersion == "1" &&
+        _validator.expCtxForFilter->exprUnstableForApiV1) {
+        return {ErrorCodes::APIStrictError,
+                "The validator uses unstable expression(s) for API Version 1."};
+    }
+    if (apiParams.getAPIDeprecationErrors().value_or(false) && apiVersion == "1" &&
+        _validator.expCtxForFilter->exprDeprectedForApiV1) {
+        return {ErrorCodes::APIDeprecationError,
+                "The validator uses deprecated expression(s) for API Version 1."};
+    }
+    return Status::OK();
+}
+
 Status CollectionImpl::checkValidation(OperationContext* opCtx, const BSONObj& document) const {
     if (!_validator.isOK()) {
         return _validator.getStatus();
@@ -415,6 +449,11 @@ Status CollectionImpl::checkValidation(OperationContext* opCtx, const BSONObj& d
         // and the recipient should not perform validation on documents inserted into the temporary
         // resharding collection.
         return Status::OK();
+    }
+
+    auto status = checkValidatorAPIVersionCompatability(opCtx);
+    if (!status.isOK()) {
+        return status;
     }
 
     // TODO SERVER-50524: remove these FCV checks when 5.0 becomes last-lts in order to make sure

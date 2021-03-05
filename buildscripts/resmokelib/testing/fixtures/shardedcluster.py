@@ -11,11 +11,20 @@ from buildscripts.resmokelib import core
 from buildscripts.resmokelib import errors
 from buildscripts.resmokelib import logging
 from buildscripts.resmokelib import utils
+from buildscripts.resmokelib.utils.history import make_historic
 from buildscripts.resmokelib.multiversionconstants import LAST_LTS_MONGOS_BINARY
 from buildscripts.resmokelib.testing.fixtures import interface
 from buildscripts.resmokelib.testing.fixtures import replicaset
 from buildscripts.resmokelib.testing.fixtures import standalone
 from buildscripts.resmokelib.utils import registry
+
+# The default verbosity setting for any tests that are not started with an Evergreen task id. This
+# will apply to any tests run locally.
+DEFAULT_MONGOS_LOG_COMPONENT_VERBOSITY = make_historic({"transaction": 3})
+
+# The default verbosity setting for any tests running in Evergreen i.e. started with an Evergreen
+# task id.
+DEFAULT_EVERGREEN_MONGOS_LOG_COMPONENT_VERBOSITY = make_historic({"transaction": 3})
 
 
 class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-instance-attributes
@@ -38,12 +47,13 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
             raise ValueError("Cannot specify mongod_options.dbpath")
 
         self.mongos_executable = mongos_executable
-        self.mongos_options = utils.default_if_none(mongos_options, {})
-        self.mongod_options = utils.default_if_none(mongod_options, {})
+        self.mongos_options = make_historic(utils.default_if_none(mongos_options, {}))
+        self.mongod_options = make_historic(utils.default_if_none(mongod_options, {}))
         self.mongod_executable = mongod_executable
-        self.mongod_options["set_parameters"] = mongod_options.get("set_parameters", {}).copy()
+        self.mongod_options["set_parameters"] = make_historic(
+            mongod_options.get("set_parameters", {})).copy()
         self.mongod_options["set_parameters"]["migrationLockAcquisitionMaxWaitMS"] = \
-                mongod_options["set_parameters"].get("migrationLockAcquisitionMaxWaitMS", 30000)
+                self.mongod_options["set_parameters"].get("migrationLockAcquisitionMaxWaitMS", 30000)
         self.preserve_dbpath = preserve_dbpath
         # Use 'num_shards' and 'num_rs_nodes_per_shard' values from the command line if they exist.
         num_shards_option = config.NUM_SHARDS
@@ -55,11 +65,18 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
         self.enable_balancer = enable_balancer
         self.enable_autosplit = enable_autosplit
         self.auth_options = auth_options
-        self.configsvr_options = utils.default_if_none(configsvr_options, {})
-        self.shard_options = utils.default_if_none(shard_options, {})
+        self.configsvr_options = make_historic(utils.default_if_none(configsvr_options, {}))
+        self.shard_options = make_historic(utils.default_if_none(shard_options, {}))
         self.mixed_bin_versions = utils.default_if_none(mixed_bin_versions,
                                                         config.MIXED_BIN_VERSIONS)
-        if self.mixed_bin_versions is not None and num_rs_nodes_per_shard is not None:
+
+        if self.num_rs_nodes_per_shard is None:
+            raise TypeError("num_rs_nodes_per_shard must be an integer but found None")
+        elif isinstance(self.num_rs_nodes_per_shard, int):
+            if self.num_rs_nodes_per_shard <= 0:
+                raise ValueError("num_rs_nodes_per_shard must be a positive integer")
+
+        if self.mixed_bin_versions is not None:
             num_mongods = self.num_shards * self.num_rs_nodes_per_shard
             if len(self.mixed_bin_versions) != num_mongods:
                 msg = (("The number of binary versions specified: {} do not match the number of"\
@@ -96,14 +113,7 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
 
         if not self.shards:
             for i in range(self.num_shards):
-                if self.num_rs_nodes_per_shard is None:
-                    shard = self._new_standalone_shard(i)
-                elif isinstance(self.num_rs_nodes_per_shard, int):
-                    if self.num_rs_nodes_per_shard <= 0:
-                        raise ValueError("num_rs_nodes_per_shard must be a positive integer")
-                    shard = self._new_rs_shard(i, self.num_rs_nodes_per_shard)
-                else:
-                    raise TypeError("num_rs_nodes_per_shard must be an integer or None")
+                shard = self._new_rs_shard(i, self.num_rs_nodes_per_shard)
                 self.shards.append(shard)
 
         # Start up each of the shards
@@ -169,8 +179,7 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
             primary.admin.command({"refreshLogicalSessionCacheNow": 1})
 
         for shard in self.shards:
-            primary = (shard.mongo_client() if self.num_rs_nodes_per_shard is None else
-                       shard.get_primary().mongo_client())
+            primary = shard.get_primary().mongo_client()
             primary.admin.command({"refreshLogicalSessionCacheNow": 1})
 
     def _auth_to_db(self, client):
@@ -270,7 +279,7 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
         replset_config_options["configsvr"] = True
 
         mongod_options = self.mongod_options.copy()
-        mongod_options.update(configsvr_options.pop("mongod_options", {}))
+        mongod_options.update(make_historic(configsvr_options.pop("mongod_options", {})))
         mongod_options["configsvr"] = ""
         mongod_options["dbpath"] = os.path.join(self._dbpath_prefix, "config")
         mongod_options["replSet"] = ShardedClusterFixture._CONFIGSVR_REPLSET_NAME
@@ -295,7 +304,7 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
         auth_options = shard_options.pop("auth_options", self.auth_options)
         preserve_dbpath = shard_options.pop("preserve_dbpath", self.preserve_dbpath)
 
-        replset_config_options = shard_options.pop("replset_config_options", {})
+        replset_config_options = make_historic(shard_options.pop("replset_config_options", {}))
         replset_config_options["configsvr"] = False
 
         mixed_bin_versions = self.mixed_bin_versions
@@ -305,7 +314,7 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
                                                     num_rs_nodes_per_shard]
 
         mongod_options = self.mongod_options.copy()
-        mongod_options.update(shard_options.pop("mongod_options", {}))
+        mongod_options.update(make_historic(shard_options.pop("mongod_options", {})))
         mongod_options["shardsvr"] = ""
         mongod_options["dbpath"] = os.path.join(self._dbpath_prefix, "shard{}".format(index))
         mongod_options["replSet"] = ShardedClusterFixture._SHARD_REPLSET_NAME_PREFIX + str(index)
@@ -316,25 +325,6 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
             num_nodes=num_rs_nodes_per_shard, auth_options=auth_options,
             replset_config_options=replset_config_options, mixed_bin_versions=mixed_bin_versions,
             shard_logging_prefix=shard_logging_prefix, **shard_options)
-
-    def _new_standalone_shard(self, index):
-        """Return a standalone.MongoDFixture configured as a shard in a sharded cluster."""
-
-        mongod_logger = logging.loggers.new_fixture_node_logger(
-            self.__class__.__name__, self.job_num, "shard{}".format(index))
-
-        shard_options = self.shard_options.copy()
-
-        preserve_dbpath = shard_options.pop("preserve_dbpath", self.preserve_dbpath)
-
-        mongod_options = self.mongod_options.copy()
-        mongod_options.update(shard_options.pop("mongod_options", {}))
-        mongod_options["shardsvr"] = ""
-        mongod_options["dbpath"] = os.path.join(self._dbpath_prefix, "shard{}".format(index))
-
-        return standalone.MongoDFixture(mongod_logger, self.job_num, mongod_options=mongod_options,
-                                        mongod_executable=self.mongod_executable,
-                                        preserve_dbpath=preserve_dbpath, **shard_options)
 
     def _new_mongos(self, index, total):
         """
@@ -375,6 +365,13 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
         client.admin.command({"addShard": connection_string})
 
 
+def default_mongos_log_component_verbosity():
+    """Return the default 'logComponentVerbosity' value to use for mongos processes."""
+    if config.EVERGREEN_TASK_ID:
+        return DEFAULT_EVERGREEN_MONGOS_LOG_COMPONENT_VERBOSITY
+    return DEFAULT_MONGOS_LOG_COMPONENT_VERBOSITY
+
+
 class _MongoSFixture(interface.Fixture):
     """Fixture which provides JSTests with a mongos to connect to."""
 
@@ -389,7 +386,7 @@ class _MongoSFixture(interface.Fixture):
         # Default to command line options if the YAML configuration is not passed in.
         self.mongos_executable = utils.default_if_none(mongos_executable, config.MONGOS_EXECUTABLE)
 
-        self.mongos_options = utils.default_if_none(mongos_options, {}).copy()
+        self.mongos_options = make_historic(utils.default_if_none(mongos_options, {})).copy()
 
         self.mongos = None
         self.port = None
@@ -406,8 +403,8 @@ class _MongoSFixture(interface.Fixture):
                 port=self.port)
             self.mongos_options["logappend"] = ""
 
-        mongos = core.programs.mongos_program(
-            self.logger, self.job_num, executable=self.mongos_executable, **self.mongos_options)
+        mongos = _mongos_program(self.logger, self.job_num, executable=self.mongos_executable,
+                                 **self.mongos_options)
         try:
             self.logger.info("Starting mongos on port %d...\n%s", self.port, mongos.as_command())
             mongos.start()
@@ -509,5 +506,28 @@ class _MongoSFixture(interface.Fixture):
 
     def get_node_info(self):
         """Return a list of NodeInfo objects."""
-        info = interface.NodeInfo(name=self.logger.name, port=self.port, pid=self.mongos.pid)
+        info = interface.NodeInfo(full_name=self.logger.full_name, name=self.logger.name,
+                                  port=self.port, pid=self.mongos.pid)
         return [info]
+
+
+def _mongos_program(logger, job_num, test_id=None, executable=None, process_kwargs=None, **kwargs):
+    """Return a Process instance that starts a mongos with arguments constructed from 'kwargs'."""
+
+    executable = utils.default_if_none(executable, config.DEFAULT_MONGOS_EXECUTABLE)
+
+    # Apply the --setParameter command line argument. Command line options to resmoke.py override
+    # the YAML configuration.
+    suite_set_parameters = kwargs.setdefault("set_parameters", {})
+
+    if config.MONGOS_SET_PARAMETERS is not None:
+        suite_set_parameters.update(utils.load_yaml(config.MONGOS_SET_PARAMETERS))
+
+    # Set default log verbosity levels if none were specified.
+    if "logComponentVerbosity" not in suite_set_parameters:
+        suite_set_parameters["logComponentVerbosity"] = default_mongos_log_component_verbosity()
+
+    standalone.add_testing_set_parameters(suite_set_parameters)
+
+    return core.programs.mongos_program(logger, job_num, test_id, executable, process_kwargs,
+                                        **kwargs)

@@ -52,6 +52,9 @@ class TaskExecutor;
 
 class OperationContext;
 
+/**
+ * Transfer config.transaction information from a given source shard to this shard.
+ */
 class ReshardingTxnCloner {
 public:
     ReshardingTxnCloner(ReshardingSourceId sourceId, Timestamp fetchTimestamp);
@@ -63,7 +66,6 @@ public:
      * [
      *      {$match: {_id: {$gt: <startAfter>}}},
      *      {$sort: {_id: 1}},
-     *      {$match: {"lastWriteOpTime.ts": {$lt: <fetchTimestamp>}}},
      * ]
      */
     std::unique_ptr<Pipeline, PipelineDeleter> makePipeline(
@@ -74,6 +76,7 @@ public:
     ExecutorFuture<void> run(
         ServiceContext* serviceContext,
         std::shared_ptr<executor::TaskExecutor> executor,
+        CancelationToken cancelToken,
         std::shared_ptr<MongoProcessInterface> mongoProcessInterface_forTest = nullptr);
 
     void updateProgressDocument_forTest(OperationContext* opCtx, const LogicalSessionId& progress) {
@@ -86,26 +89,16 @@ private:
     std::unique_ptr<Pipeline, PipelineDeleter> _targetAggregationRequest(OperationContext* opCtx,
                                                                          const Pipeline& pipeline);
 
-    ServiceContext::UniqueOperationContext _makeOperationContext(ServiceContext* serviceContext);
-
-    ExecutorFuture<std::pair<ServiceContext::UniqueOperationContext,
-                             std::unique_ptr<MongoDOperationContextSession>>>
-    _checkOutSession(ServiceContext* serviceContext,
-                     std::shared_ptr<executor::TaskExecutor> executor,
-                     SessionTxnRecord donorRecord);
+    template <typename Callable>
+    boost::optional<SharedSemiFuture<void>> _withSessionCheckedOut(
+        OperationContext* opCtx, const SessionTxnRecord& donorRecord, Callable&& callable);
 
     void _updateSessionRecord(OperationContext* opCtx);
 
     void _updateProgressDocument(OperationContext* opCtx, const LogicalSessionId& progress);
 
     template <typename Callable>
-    auto _withTemporaryOperationContext(ServiceContext* serviceContext, Callable&& callable);
-
-    ExecutorFuture<void> _updateSessionRecordsUntilPipelineExhausted(
-        ServiceContext* serviceContext,
-        std::shared_ptr<executor::TaskExecutor> executor,
-        std::unique_ptr<Pipeline, PipelineDeleter> pipeline,
-        int progressCounter);
+    auto _withTemporaryOperationContext(Callable&& callable);
 
     const ReshardingSourceId _sourceId;
     const Timestamp _fetchTimestamp;
@@ -116,7 +109,6 @@ private:
  * pipeline: [
  *      {$match: {_id: {$gt: <startAfter>}}},
  *      {$sort: {_id: 1}},
- *      {$match: {"lastWriteOpTime.ts": {$lt: <fetchTimestamp>}}},
  * ],
  * Note that the caller is responsible for making sure that the transactions ns is set in the
  * expCtx.

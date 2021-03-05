@@ -134,7 +134,15 @@ void IndexConsistency::repairMissingIndexEntries(OperationContext* opCtx,
     for (auto it = _missingIndexEntries.begin(); it != _missingIndexEntries.end();) {
         const IndexKey& key = it->first;
         const KeyString::Value& ks = it->second.keyString;
-        const RecordId rid = KeyString::decodeRecordIdAtEnd(ks.getBuffer(), ks.getSize());
+        const KeyFormat keyFormat = _validateState->getCollection()->getRecordStore()->keyFormat();
+
+        RecordId rid;
+        if (keyFormat == KeyFormat::Long) {
+            rid = KeyString::decodeRecordIdLongAtEnd(ks.getBuffer(), ks.getSize());
+        } else {
+            invariant(keyFormat == KeyFormat::String);
+            rid = KeyString::decodeRecordIdStrAtEnd(ks.getBuffer(), ks.getSize());
+        }
 
         const std::string& indexName = key.first;
         if (indexName != index->descriptor()->indexName()) {
@@ -491,14 +499,21 @@ BSONObj IndexConsistency::_generateInfo(const std::string& indexName,
 
     BSONObj rehydratedKey = b.done();
 
+    BSONObjBuilder infoBuilder;
+    infoBuilder.append("indexName", indexName);
+    infoBuilder.append(
+        "recordId",
+        recordId.withFormat([](RecordId::Null n) { return std::string("null"); },
+                            [](int64_t rid) { return std::to_string(rid); },
+                            [](const char* str, int size) { return OID::from(str).toString(); }));
+
     if (!idKey.isEmpty()) {
-        invariant(idKey.nFields() == 1);
-        return BSON("indexName" << indexName << "recordId" << recordId.asLong() << "idKey" << idKey
-                                << "indexKey" << rehydratedKey);
-    } else {
-        return BSON("indexName" << indexName << "recordId" << recordId.asLong() << "indexKey"
-                                << rehydratedKey);
+        infoBuilder.append("idKey", idKey);
     }
+
+    infoBuilder.append("indexKey", rehydratedKey);
+
+    return infoBuilder.obj();
 }
 
 uint32_t IndexConsistency::_hashKeyString(const KeyString::Value& ks,

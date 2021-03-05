@@ -42,17 +42,49 @@
 
 namespace mongo {
 
+class ReshardingMetrics;
 class ServiceContext;
 class ThreadPool;
 
 /**
  * Applies oplog entries from a specific donor for resharding.
  *
+ * @param sourceId combines the resharding run's UUID with the donor ShardId.
+ * @param oplogNs is the namespace for the collection containing oplog entries this
+ *                ReshardingOplogApplier will read from and apply. There is one oplog per donor.
+ * @param nsBeingResharded is the namespace of the collection being resharded.
+ * @param collUUIDBeingResharded is the UUID of the collection being resharded.
+ * @param allStashNss are the namespaces of the stash collections. There is one stash collection for
+ *                    each donor. This ReshardingOplogApplier will write documents as necessary to
+ *                    the stash collection at `myStashIdx` and may need to read and delete documents
+ *                    from any of the other stash collections.
+ * @param myStashIdx -- see above.
+ * @param reshardingCloneFinishedTs is the timestamp that represents when cloning documents
+ *                                  finished. Applying entries through this time implies the
+ *                                  resharded collection contains a consistent snapshot of data at
+ *                                  that timestamp.
+ *
  * This is not thread safe.
  */
 class ReshardingOplogApplier {
 public:
-    ReshardingOplogApplier(ServiceContext* service,
+    class Env {
+    public:
+        Env(ServiceContext* service, ReshardingMetrics* metrics)
+            : _service(service), _metrics(metrics) {}
+        ServiceContext* service() const {
+            return _service;
+        }
+        ReshardingMetrics* metrics() const {
+            return _metrics;
+        }
+
+    private:
+        ServiceContext* _service;
+        ReshardingMetrics* _metrics;
+    };
+
+    ReshardingOplogApplier(std::unique_ptr<Env> env,
                            ReshardingSourceId sourceId,
                            NamespaceString oplogNs,
                            NamespaceString nsBeingResharded,
@@ -129,6 +161,11 @@ private:
      */
     Status _onError(Status status);
 
+    /** The ServiceContext to use internally. */
+    ServiceContext* _service() const {
+        return _env->service();
+    }
+
     /**
      * Records the progress made by this applier to storage. Returns the timestamp of the progress
      * recorded.
@@ -136,6 +173,8 @@ private:
     Timestamp _clearAppliedOpsAndStoreProgress(OperationContext* opCtx);
 
     static constexpr auto kClientName = "ReshardingOplogApplier"_sd;
+
+    std::unique_ptr<Env> _env;
 
     // Identifier for the oplog source.
     const ReshardingSourceId _sourceId;
@@ -170,9 +209,6 @@ private:
     // R - Read relaxed. Can read freely without holding mutex because there are no case where
     //     more than one thread will modify it concurrently while being read.
     // S - Special case. Manages it's own concurrency. Can access without holding mutex.
-
-    // (S)
-    ServiceContext* _service;
 
     // (S)
     std::shared_ptr<executor::TaskExecutor> _executor;

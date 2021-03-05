@@ -57,7 +57,8 @@ var CollInfos = class {
                 ns: ns,
                 host: this.conn.host,
                 UUID: collInfoRaw.info.uuid,
-                count: coll.find().itcount()
+                count: coll.find().itcount(),
+                raw: collInfoRaw,
             };
         }
 
@@ -320,6 +321,8 @@ var {DataConsistencyChecker} = (function() {
                         // from index specs in 4.4.
                         if (sourceInfo.idIndex) {
                             delete sourceInfo.idIndex.ns;
+                        }
+                        if (syncingInfo.idIndex) {
                             delete syncingInfo.idIndex.ns;
                         }
 

@@ -134,6 +134,21 @@ namespace {
 
 using namespace fmt::literals;
 
+Future<void> runCommandInvocation(std::shared_ptr<RequestExecutionContext> rec,
+                                  std::shared_ptr<CommandInvocation> invocation) {
+    auto threadingModel = [client = rec->getOpCtx()->getClient()] {
+        if (auto context = transport::ServiceExecutorContext::get(client); context) {
+            return context->getThreadingModel();
+        }
+        tassert(5453901,
+                "Threading model may only be absent for internal and direct clients",
+                !client->hasRemote() || client->isInDirectClient());
+        return transport::ServiceExecutor::ThreadingModel::kDedicated;
+    }();
+    return CommandHelpers::runCommandInvocation(
+        std::move(rec), std::move(invocation), threadingModel);
+}
+
 /*
  * Allows for the very complex handleRequest function to be decomposed into parts.
  * It also provides the infrastructure to futurize the process of executing commands.
@@ -791,10 +806,12 @@ private:
 Future<void> InvokeCommand::run() {
     return makeReadyFutureWith([&] {
                auto execContext = _ecd->getExecutionContext();
+               // TODO SERVER-53761: find out if we can do this more asynchronously. The client
+               // Strand is locked to current thread in ServiceStateMachine::Impl::startNewLoop().
                tenant_migration_access_blocker::checkIfCanReadOrBlock(
-                   execContext->getOpCtx(), execContext->getRequest().getDatabase());
-               return CommandHelpers::runCommandInvocationAsync(_ecd->getExecutionContext(),
-                                                                _ecd->getInvocation());
+                   execContext->getOpCtx(), execContext->getRequest().getDatabase())
+                   .get();
+               return runCommandInvocation(_ecd->getExecutionContext(), _ecd->getInvocation());
            })
         .onError<ErrorCodes::TenantMigrationConflict>([this](Status status) {
             tenant_migration_access_blocker::handleTenantMigrationConflict(
@@ -808,10 +825,11 @@ Future<void> CheckoutSessionAndInvokeCommand::run() {
                _checkOutSession();
 
                auto execContext = _ecd->getExecutionContext();
+               // TODO SERVER-53761: find out if we can do this more asynchronously.
                tenant_migration_access_blocker::checkIfCanReadOrBlock(
-                   execContext->getOpCtx(), execContext->getRequest().getDatabase());
-               return CommandHelpers::runCommandInvocationAsync(_ecd->getExecutionContext(),
-                                                                _ecd->getInvocation());
+                   execContext->getOpCtx(), execContext->getRequest().getDatabase())
+                   .get();
+               return runCommandInvocation(_ecd->getExecutionContext(), _ecd->getInvocation());
            })
         .onError<ErrorCodes::TenantMigrationConflict>([this](Status status) {
             // Abort transaction and clean up transaction resources before blocking the
@@ -1343,9 +1361,9 @@ void ExecCommandDatabase::_initiateCommand() {
     StringMap<int> topLevelFields;
     for (auto&& element : request.body) {
         StringData fieldName = element.fieldNameStringData();
-        if (fieldName == QueryRequest::cmdOptionMaxTimeMS) {
+        if (fieldName == query_request_helper::cmdOptionMaxTimeMS) {
             cmdOptionMaxTimeMSField = element;
-        } else if (fieldName == QueryRequest::kMaxTimeMSOpOnlyField) {
+        } else if (fieldName == query_request_helper::kMaxTimeMSOpOnlyField) {
             uassert(ErrorCodes::InvalidOptions,
                     "Can not specify maxTimeMSOpOnly for non internal clients",
                     _isInternalClient());
@@ -1356,7 +1374,7 @@ void ExecCommandDatabase::_initiateCommand() {
             helpField = element;
         } else if (fieldName == "comment") {
             opCtx->setComment(element.wrap());
-        } else if (fieldName == QueryRequest::queryOptionMaxTimeMS) {
+        } else if (fieldName == query_request_helper::queryOptionMaxTimeMS) {
             uasserted(ErrorCodes::InvalidOptions,
                       "no such command option $maxTimeMs; use maxTimeMS instead");
         }

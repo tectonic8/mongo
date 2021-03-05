@@ -16,6 +16,16 @@ function getWinningPlan(queryPlanner) {
 }
 
 /**
+ * Returns an element of explain output which represents a rejected candidate plan.
+ */
+function getRejectedPlan(rejectedPlan) {
+    // The 'queryPlan' format is used when the SBE engine is turned on. If this field is present,
+    // it will hold a serialized winning plan, otherwise it will be stored in the 'rejectedPlan'
+    // element itself.
+    return rejectedPlan.hasOwnProperty("queryPlan") ? rejectedPlan.queryPlan : rejectedPlan;
+}
+
+/**
  * Given the root stage of explain's JSON representation of a query plan ('root'), returns all
  * subdocuments whose stage is 'stage'. Returns an empty array if the plan does not have the
  * requested stage.
@@ -41,6 +51,11 @@ function getPlanStages(root, stage) {
         results = results.concat(getPlanStages(getWinningPlan(root.queryPlanner), stage));
     }
 
+    // This field is used in SBE explain output.
+    if ("queryPlan" in root) {
+        results = results.concat(getPlanStages(root.queryPlan, stage));
+    }
+
     if ("thenStage" in root) {
         results = results.concat(getPlanStages(root.thenStage, stage));
     }
@@ -59,11 +74,12 @@ function getPlanStages(root, stage) {
 
     if ("shards" in root) {
         if (Array.isArray(root.shards)) {
-            results = root.shards.reduce(
-                (res, shard) => res.concat(getPlanStages(
-                    shard.hasOwnProperty("winningPlan") ? shard.winningPlan : shard.executionStages,
-                    stage)),
-                results);
+            results =
+                root.shards.reduce((res, shard) => res.concat(getPlanStages(
+                                       shard.hasOwnProperty("winningPlan") ? getWinningPlan(shard)
+                                                                           : shard.executionStages,
+                                       stage)),
+                                   results);
         } else {
             const shards = Object.keys(root.shards);
             results = shards.reduce(
@@ -173,10 +189,13 @@ function getExecutionStages(root) {
  * subdocuments whose stage is 'stage'. This can either be an agg stage name like "$cursor" or
  * "$sort", or a query stage name like "IXSCAN" or "SORT".
  *
+ * If 'useQueryPlannerSection' is set to 'true', the 'queryPlanner' section of the explain output
+ * will be used to lookup the given 'stage', even if 'executionStats' section is available.
+ *
  * Returns an empty array if the plan does not have the requested stage. Asserts that agg explain
  * structure matches expected format.
  */
-function getAggPlanStages(root, stage) {
+function getAggPlanStages(root, stage, useQueryPlannerSection = false) {
     let results = [];
 
     function getDocumentSources(docSourceArray) {
@@ -198,7 +217,7 @@ function getAggPlanStages(root, stage) {
 
         // If execution stats are available, then use the execution stats tree. Otherwise use the
         // plan info from the "queryPlanner" section.
-        if (queryLayerOutput.hasOwnProperty("executionStats")) {
+        if (queryLayerOutput.hasOwnProperty("executionStats") && !useQueryPlannerSection) {
             assert(queryLayerOutput.executionStats.hasOwnProperty("executionStages"));
             results = results.concat(
                 getPlanStages(queryLayerOutput.executionStats.executionStages, stage));
@@ -402,14 +421,21 @@ function assertExplainCount({explainResults, expectedCount}) {
         for (let shardExplain of execStages.shards) {
             const countStage = shardExplain.executionStages;
             assert(countStage.stage === "COUNT" || countStage.stage === "RECORD_STORE_FAST_COUNT",
-                   "root stage on shard is not COUNT or RECORD_STORE_FAST_COUNT");
+                   `Root stage on shard is not COUNT or RECORD_STORE_FAST_COUNT. ` +
+                       `The actual plan is: ${tojson(explainResults)}`);
             totalCounted += countStage.nCounted;
         }
-        assert.eq(totalCounted, expectedCount, "wrong count result");
+        assert.eq(totalCounted,
+                  expectedCount,
+                  assert.eq(totalCounted, expectedCount, "wrong count result"));
     } else {
         assert(execStages.stage === "COUNT" || execStages.stage === "RECORD_STORE_FAST_COUNT",
-               "root stage on shard is not COUNT or RECORD_STORE_FAST_COUNT");
-        assert.eq(execStages.nCounted, expectedCount, "wrong count result");
+               `Root stage on shard is not COUNT or RECORD_STORE_FAST_COUNT. ` +
+                   `The actual plan is: ${tojson(explainResults)}`);
+        assert.eq(
+            execStages.nCounted,
+            expectedCount,
+            "Wrong count result. Actual: " + execStages.nCounted + "expected: " + expectedCount);
     }
 }
 

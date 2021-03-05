@@ -46,6 +46,7 @@
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/s/cluster_ddl.h"
 #include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/commands/document_shard_key_update_util.h"
 #include "mongo/s/commands/strategy.h"
@@ -55,7 +56,6 @@
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/transaction_router.h"
 #include "mongo/s/would_change_owning_shard_exception.h"
-#include "mongo/s/write_ops/cluster_write.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -174,7 +174,7 @@ public:
     FindAndModifyCmd()
         : BasicCommand("findAndModify", "findandmodify"), _updateMetrics{"findAndModify"} {}
 
-    const std::set<std::string>& apiVersions() const {
+    const std::set<std::string>& apiVersions() const override {
         return kApiVersions1;
     }
 
@@ -191,7 +191,7 @@ public:
     }
 
     ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
-                                                 repl::ReadConcernLevel level) const final {
+                                                 repl::ReadConcernLevel level) const override {
         return {{level != repl::ReadConcernLevel::kLocalReadConcern &&
                      level != repl::ReadConcernLevel::kSnapshotReadConcern,
                  {ErrorCodes::InvalidOptions, "read concern not supported"}},
@@ -201,7 +201,6 @@ public:
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
                                std::vector<Privilege>* out) const override {
-
         bool update = cmdObj["update"].trueValue();
         bool upsert = cmdObj["upsert"].trueValue();
         bool remove = cmdObj["remove"].trueValue();
@@ -221,7 +220,7 @@ public:
             actions.addAction(ActionType::bypassDocumentValidation);
         }
 
-        const std::string ns = CommandHelpers::parseNsFromCommand(dbname, cmdObj);
+        std::string ns = CommandHelpers::parseNsFromCommand(dbname, cmdObj);
         ResourcePattern resource(CommandHelpers::resourcePatternForNamespace(ns));
         uassert(17137,
                 "Invalid target namespace " + resource.toString(),
@@ -241,7 +240,6 @@ public:
             uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
 
         std::shared_ptr<Shard> shard;
-
         if (cm.isSharded()) {
             const BSONObj query = cmdObj.getObjectField("query");
             const BSONObj collation = getCollation(cmdObj);
@@ -276,7 +274,7 @@ public:
         } else {
             _runCommand(opCtx,
                         shard->getId(),
-                        ChunkVersion::UNSHARDED(),
+                        boost::make_optional(!cm.dbVersion().isFixed(), ChunkVersion::UNSHARDED()),
                         cm.dbVersion(),
                         nss,
                         applyReadWriteConcern(opCtx, false, false, explainCmd),
@@ -310,41 +308,40 @@ public:
         // Collect metrics.
         _updateMetrics.collectMetrics(cmdObj);
 
-        // findAndModify should only be creating database if upsert is true, but this would require
-        // that the parsing be pulled into this function.
-        createShardDatabase(opCtx, nss.db());
+        // Technically, findAndModify should only be creating database if upsert is true, but this
+        // would require that the parsing be pulled into this function.
+        cluster::createDatabase(opCtx, nss.db());
 
         // Append mongoS' runtime constants to the command object before forwarding it to the shard.
         auto cmdObjForShard = appendLegacyRuntimeConstantsToCommandObject(opCtx, cmdObj);
 
         const auto cm = uassertStatusOK(getCollectionRoutingInfoForTxnCmd(opCtx, nss));
-        if (!cm.isSharded()) {
+        if (cm.isSharded()) {
+            const BSONObj query = cmdObjForShard.getObjectField("query");
+            const BSONObj collation = getCollation(cmdObjForShard);
+            const auto let = getLet(cmdObjForShard);
+            const auto rc = getLegacyRuntimeConstants(cmdObjForShard);
+            const BSONObj shardKey =
+                getShardKey(opCtx, cm, nss, query, collation, boost::none, let, rc);
+
+            auto chunk = cm.findIntersectingChunk(shardKey, collation);
+
+            _runCommand(opCtx,
+                        chunk.getShardId(),
+                        cm.getVersion(chunk.getShardId()),
+                        boost::none,
+                        nss,
+                        applyReadWriteConcern(opCtx, this, cmdObjForShard),
+                        &result);
+        } else {
             _runCommand(opCtx,
                         cm.dbPrimary(),
-                        ChunkVersion::UNSHARDED(),
+                        boost::make_optional(!cm.dbVersion().isFixed(), ChunkVersion::UNSHARDED()),
                         cm.dbVersion(),
                         nss,
                         applyReadWriteConcern(opCtx, this, cmdObjForShard),
                         &result);
-            return true;
         }
-
-        const BSONObj query = cmdObjForShard.getObjectField("query");
-        const BSONObj collation = getCollation(cmdObjForShard);
-        const auto let = getLet(cmdObjForShard);
-        const auto rc = getLegacyRuntimeConstants(cmdObjForShard);
-        const BSONObj shardKey =
-            getShardKey(opCtx, cm, nss, query, collation, boost::none, let, rc);
-
-        auto chunk = cm.findIntersectingChunk(shardKey, collation);
-
-        _runCommand(opCtx,
-                    chunk.getShardId(),
-                    cm.getVersion(chunk.getShardId()),
-                    boost::none,
-                    nss,
-                    applyReadWriteConcern(opCtx, this, cmdObjForShard),
-                    &result);
 
         return true;
     }
@@ -352,8 +349,8 @@ public:
 private:
     static void _runCommand(OperationContext* opCtx,
                             const ShardId& shardId,
-                            const ChunkVersion& shardVersion,
-                            boost::optional<DatabaseVersion> dbVersion,
+                            const boost::optional<ChunkVersion>& shardVersion,
+                            const boost::optional<DatabaseVersion>& dbVersion,
                             const NamespaceString& nss,
                             const BSONObj& cmdObj,
                             BSONObjBuilder* result) {
@@ -365,7 +362,10 @@ private:
             if (dbVersion) {
                 cmdObjWithVersions = appendDbVersionIfPresent(cmdObjWithVersions, *dbVersion);
             }
-            requests.emplace_back(shardId, appendShardVersion(cmdObjWithVersions, shardVersion));
+            if (shardVersion) {
+                cmdObjWithVersions = appendShardVersion(cmdObjWithVersions, *shardVersion);
+            }
+            requests.emplace_back(shardId, cmdObjWithVersions);
 
             MultiStatementTransactionRequestsSender ars(
                 opCtx,

@@ -61,6 +61,153 @@
 #include "mongo/db/s/collection_sharding_state.h"
 
 namespace mongo::stage_builder {
+namespace {
+/**
+ * Tree representation of an index key pattern.
+ *
+ * For example, the key pattern {a.b: 1, x: 1, a.c: 1} would look like:
+ *
+ *         <root>
+ *         /   |
+ *        a    x
+ *       / \
+ *      b   c
+ *
+ * This tree is used for building SBE subtrees to re-hydrate index keys.
+ */
+struct IndexKeyPatternTreeNode {
+    IndexKeyPatternTreeNode* emplace(StringData fieldComponent) {
+        auto newNode = std::make_unique<IndexKeyPatternTreeNode>();
+        const auto newNodeRaw = newNode.get();
+        children.emplace(fieldComponent, std::move(newNode));
+        childrenOrder.push_back(fieldComponent.toString());
+
+        return newNodeRaw;
+    }
+
+    StringMap<std::unique_ptr<IndexKeyPatternTreeNode>> children;
+    std::vector<std::string> childrenOrder;
+
+    // Which slot the index key for this component is stored in. May be boost::none for non-leaf
+    // nodes.
+    boost::optional<sbe::value::SlotId> indexKeySlot;
+};
+
+/**
+ * Given a key pattern and an array of slots of equal size, builds an IndexKeyPatternTreeNode
+ * representing the mapping between key pattern component and slot.
+ *
+ * Note that this will "short circuit" in cases where the index key pattern contains two components
+ * where one is a subpath of the other. For example with the key pattern {a:1, a.b: 1}, the "a.b"
+ * component will not be represented in the output tree. For the purpose of rehydrating index keys,
+ * this is fine (and actually preferable).
+ */
+std::unique_ptr<IndexKeyPatternTreeNode> buildKeyPatternTree(const BSONObj& keyPattern,
+                                                             const sbe::value::SlotVector& slots) {
+    size_t i = 0;
+
+    auto root = std::make_unique<IndexKeyPatternTreeNode>();
+    for (auto&& elem : keyPattern) {
+        auto* node = root.get();
+        bool skipElem = false;
+
+        FieldRef fr(elem.fieldNameStringData());
+        for (FieldIndex j = 0; j < fr.numParts(); ++j) {
+            const auto part = fr.getPart(j);
+            if (auto it = node->children.find(part); it != node->children.end()) {
+                node = it->second.get();
+                if (node->indexKeySlot) {
+                    // We're processing the a sub-path of a path that's already indexed.  We can
+                    // bail out here since we won't use the sub-path when reconstructing the
+                    // object.
+                    skipElem = true;
+                    break;
+                }
+            } else {
+                node = node->emplace(part);
+            }
+        }
+
+        if (!skipElem) {
+            node->indexKeySlot = slots[i];
+        }
+
+        ++i;
+    }
+
+    return root;
+}
+
+/**
+ * Given a root IndexKeyPatternTreeNode, this function will construct an SBE expression for
+ * producing a partial object from an index key.
+ *
+ * For example, given the index key pattern {a.b: 1, x: 1, a.c: 1} and the index key
+ * {"": 1, "": 2, "": 3}, the SBE expression would produce the object {a: {b:1, c: 3}, x: 2}.
+ */
+std::unique_ptr<sbe::EExpression> buildNewObjExpr(const IndexKeyPatternTreeNode* kpTree) {
+
+    std::vector<std::unique_ptr<sbe::EExpression>> args;
+    for (auto&& fieldName : kpTree->childrenOrder) {
+        auto it = kpTree->children.find(fieldName);
+
+        args.emplace_back(makeConstant(fieldName));
+        if (it->second->indexKeySlot) {
+            args.emplace_back(makeVariable(*it->second->indexKeySlot));
+        } else {
+            // The reason this is in an else branch is that in the case where we have an index key
+            // like {a.b: ..., a: ...}, we've already made the logic for reconstructing the 'a'
+            // portion, so the 'a.b' subtree can be skipped.
+            args.push_back(buildNewObjExpr(it->second.get()));
+        }
+    }
+
+    return sbe::makeE<sbe::EFunction>("newObj", std::move(args));
+}
+
+/**
+ * Given a stage, and index key pattern a corresponding array of slot IDs, this function
+ * add a ProjectStage to the tree which rehydrates the index key and stores the result in
+ * 'resultSlot.'
+ */
+std::unique_ptr<sbe::PlanStage> rehydrateIndexKey(std::unique_ptr<sbe::PlanStage> stage,
+                                                  const BSONObj& indexKeyPattern,
+                                                  PlanNodeId nodeId,
+                                                  const sbe::value::SlotVector& indexKeySlots,
+                                                  sbe::value::SlotId resultSlot) {
+    auto kpTree = buildKeyPatternTree(indexKeyPattern, indexKeySlots);
+    auto keyExpr = buildNewObjExpr(kpTree.get());
+
+    return sbe::makeProjectStage(std::move(stage), nodeId, resultSlot, std::move(keyExpr));
+}
+
+/**
+ * Generates an EOF plan. Note that even though this plan will return nothing, it will still define
+ * the slots specified by 'reqs'.
+ */
+std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateEofPlan(
+    PlanNodeId nodeId, const PlanStageReqs& reqs, sbe::value::SlotIdGenerator* slotIdGenerator) {
+    sbe::value::SlotMap<std::unique_ptr<sbe::EExpression>> projects;
+
+    PlanStageSlots outputs(reqs, slotIdGenerator);
+    outputs.forEachSlot(reqs, [&](auto&& slot) {
+        projects.insert({slot, sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Nothing, 0)});
+    });
+
+    auto stage = sbe::makeS<sbe::LimitSkipStage>(
+        sbe::makeS<sbe::CoScanStage>(nodeId), 0, boost::none, nodeId);
+
+    if (!projects.empty()) {
+        // Even though this SBE tree will produce zero documents, we still need a ProjectStage to
+        // define the slots in 'outputSlots' so that calls to getAccessor() won't fail.
+        stage = sbe::makeS<sbe::ProjectStage>(std::move(stage), std::move(projects), nodeId);
+    }
+
+    return {std::move(stage), std::move(outputs)};
+}
+}  // namespace
+
+
 std::unique_ptr<sbe::RuntimeEnvironment> makeRuntimeEnvironment(
     const CanonicalQuery& cq,
     OperationContext* opCtx,
@@ -137,7 +284,6 @@ sbe::LockAcquisitionCallback makeLockAcquisitionCallback(bool checkNodeCanServeR
             opCtx, coll.getNss(), true));
     };
 }
-
 }  // namespace
 
 SlotBasedStageBuilder::SlotBasedStageBuilder(OperationContext* opCtx,
@@ -229,8 +375,13 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
 
 std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder::buildVirtualScan(
     const QuerySolutionNode* root, const PlanStageReqs& reqs) {
+    using namespace std::literals;
     auto vsn = static_cast<const VirtualScanNode*>(root);
-    invariant(!reqs.getIndexKeyBitset());
+    // The caller should only have requested components of the index key if the virtual scan is
+    // mocking an index scan.
+    if (vsn->scanType == VirtualScanNode::ScanType::kCollScan) {
+        invariant(!reqs.getIndexKeyBitset());
+    }
 
     // Virtual scans cannot produce an oplogTsSlot, so assert that the caller doesn't need it.
     invariant(!reqs.has(kOplogTs));
@@ -245,22 +396,57 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
     }
 
     inputGuard.reset();
-    auto [scanSlots, scanStage] =
+    auto [scanSlots, stage] =
         generateVirtualScanMulti(&_slotIdGenerator, vsn->hasRecordId ? 2 : 1, inputTag, inputVal);
+
+    sbe::value::SlotId resultSlot;
+    if (vsn->hasRecordId) {
+        invariant(scanSlots.size() == 2);
+        resultSlot = scanSlots[1];
+    } else {
+        invariant(scanSlots.size() == 1);
+        resultSlot = scanSlots[0];
+    }
 
     PlanStageSlots outputs;
 
-    if (vsn->hasRecordId) {
-        invariant(scanSlots.size() == 2);
-        outputs.set(kRecordId, scanSlots[0]);
-        outputs.set(kResult, scanSlots[1]);
-    } else {
-        invariant(scanSlots.size() == 1);
-        invariant(!reqs.has(kRecordId));
-        outputs.set(kResult, scanSlots[0]);
+    if (reqs.has(kResult)) {
+        outputs.set(kResult, resultSlot);
+    } else if (reqs.getIndexKeyBitset()) {
+        // The caller wanted individual slots for certain components of a mock index scan. Use a
+        // project stage to produce those slots. Since the test will represent index keys as BSON
+        // objects, we use 'getField' expressions to extract the necessary fields.
+        invariant(!vsn->indexKeyPattern.isEmpty());
+
+        sbe::value::SlotVector indexKeySlots;
+        sbe::value::SlotMap<std::unique_ptr<sbe::EExpression>> projections;
+
+        size_t indexKeyPos = 0;
+        for (auto&& field : vsn->indexKeyPattern) {
+            if (reqs.getIndexKeyBitset()->test(indexKeyPos)) {
+                indexKeySlots.push_back(_slotIdGenerator.generate());
+                projections.emplace(
+                    indexKeySlots.back(),
+                    makeFunction("getField"sv,
+                                 sbe::makeE<sbe::EVariable>(resultSlot),
+                                 makeConstant(std::string_view{field.fieldName()})));
+            }
+            ++indexKeyPos;
+        }
+
+        stage =
+            sbe::makeS<sbe::ProjectStage>(std::move(stage), std::move(projections), root->nodeId());
+
+        outputs.setIndexKeySlots(indexKeySlots);
     }
 
-    return {std::move(scanStage), std::move(outputs)};
+    if (reqs.has(kRecordId)) {
+        invariant(vsn->hasRecordId);
+        invariant(scanSlots.size() == 2);
+        outputs.set(kRecordId, scanSlots[0]);
+    }
+
+    return {std::move(stage), std::move(outputs)};
 }
 
 std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder::buildIndexScan(
@@ -271,14 +457,70 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
     // Index scans cannot produce an oplogTsSlot, so assert that the caller doesn't need it.
     invariant(!reqs.has(kOplogTs));
 
-    return generateIndexScan(_opCtx,
-                             _collection,
-                             ixn,
-                             reqs,
-                             &_slotIdGenerator,
-                             &_spoolIdGenerator,
-                             _yieldPolicy,
-                             _lockAcquisitionCallback);
+    sbe::IndexKeysInclusionSet indexKeyBitset;
+
+    if (reqs.has(PlanStageSlots::kReturnKey) || reqs.has(PlanStageSlots::kResult)) {
+        // If either 'reqs.result' or 'reqs.returnKey' is true, we need to get all parts of the
+        // index key (regardless of what was requested by 'reqs.indexKeyBitset') so that we can
+        // create the inflated index key (keyExpr).
+        for (int i = 0; i < ixn->index.keyPattern.nFields(); ++i) {
+            indexKeyBitset.set(i);
+        }
+    } else if (reqs.getIndexKeyBitset()) {
+        indexKeyBitset = *reqs.getIndexKeyBitset();
+    }
+
+    auto [stage, outputs] = generateIndexScan(_opCtx,
+                                              _collection,
+                                              ixn,
+                                              indexKeyBitset,
+                                              &_slotIdGenerator,
+                                              &_frameIdGenerator,
+                                              &_spoolIdGenerator,
+                                              _yieldPolicy,
+                                              _data.env,
+                                              _lockAcquisitionCallback);
+
+    if (reqs.has(PlanStageSlots::kReturnKey)) {
+        std::vector<std::unique_ptr<sbe::EExpression>> mkObjArgs;
+
+        size_t i = 0;
+        for (auto&& elem : ixn->index.keyPattern) {
+            auto fieldName = elem.fieldNameStringData();
+
+            mkObjArgs.emplace_back(sbe::makeE<sbe::EConstant>(
+                std::string_view{fieldName.rawData(), fieldName.size()}));
+            mkObjArgs.emplace_back(sbe::makeE<sbe::EVariable>((*outputs.getIndexKeySlots())[i++]));
+        }
+
+        auto rawKeyExpr = sbe::makeE<sbe::EFunction>("newObj", std::move(mkObjArgs));
+        outputs.set(PlanStageSlots::kReturnKey, _slotIdGenerator.generate());
+        stage = sbe::makeProjectStage(std::move(stage),
+                                      ixn->nodeId(),
+                                      outputs.get(PlanStageSlots::kReturnKey),
+                                      std::move(rawKeyExpr));
+    }
+
+    if (reqs.has(PlanStageSlots::kResult)) {
+        outputs.set(PlanStageSlots::kResult, _slotIdGenerator.generate());
+        stage = rehydrateIndexKey(std::move(stage),
+                                  ixn->index.keyPattern,
+                                  ixn->nodeId(),
+                                  *outputs.getIndexKeySlots(),
+                                  outputs.get(PlanStageSlots::kResult));
+    }
+
+    if (reqs.getIndexKeyBitset()) {
+        outputs.setIndexKeySlots(
+            makeIndexKeyOutputSlotsMatchingParentReqs(ixn->index.keyPattern,
+                                                      *reqs.getIndexKeyBitset(),
+                                                      indexKeyBitset,
+                                                      *outputs.getIndexKeySlots()));
+    } else {
+        outputs.setIndexKeySlots(boost::none);
+    }
+
+    return {std::move(stage), std::move(outputs)};
 }
 
 std::tuple<sbe::value::SlotId, sbe::value::SlotId, std::unique_ptr<sbe::PlanStage>>
@@ -290,17 +532,16 @@ SlotBasedStageBuilder::makeLoopJoinForFetch(std::unique_ptr<sbe::PlanStage> inpu
     auto recordIdSlot = _slotIdGenerator.generate();
 
     // Scan the collection in the range [seekKeySlot, Inf).
-    auto scanStage = sbe::makeS<sbe::ScanStage>(
-        NamespaceStringOrUUID{_collection->ns().db().toString(), _collection->uuid()},
-        resultSlot,
-        recordIdSlot,
-        std::vector<std::string>{},
-        sbe::makeSV(),
-        seekKeySlot,
-        true,
-        nullptr,
-        planNodeId,
-        _lockAcquisitionCallback);
+    auto scanStage = sbe::makeS<sbe::ScanStage>(_collection->uuid(),
+                                                resultSlot,
+                                                recordIdSlot,
+                                                std::vector<std::string>{},
+                                                sbe::makeSV(),
+                                                seekKeySlot,
+                                                true,
+                                                nullptr,
+                                                planNodeId,
+                                                _lockAcquisitionCallback);
 
     // Get the recordIdSlot from the outer side (e.g., IXSCAN) and feed it to the inner side,
     // limiting the result set to 1 row.
@@ -459,6 +700,11 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
                                             std::move(getSortFieldExpr),
                                             sbe::makeE<sbe::EVariable>(*collatorSlot));
         }
+
+        // According to MQL semantics, missing values are treated as nulls during sorting.
+        getSortFieldExpr = makeFunction("fillEmpty"sv,
+                                        std::move(getSortFieldExpr),
+                                        makeConstant(sbe::value::TypeTags::Null, 0));
 
         projectMap.emplace(sortFieldVar, std::move(getSortFieldExpr));
     }
@@ -693,14 +939,13 @@ SlotBasedStageBuilder::buildProjectionCovered(const QuerySolutionNode* root,
     auto pn = static_cast<const ProjectionNodeCovered*>(root);
     invariant(pn->proj.isSimple());
 
-    // For now, we only support ProjectionNodeCovered when its child is an IndexScanNode.
-    uassert(5037301,
-            str::stream() << "Can't build exec tree for node: " << root->toString(),
-            pn->children[0]->getType() == STAGE_IXSCAN);
+    tassert(5037301,
+            str::stream() << "Can't build covered projection for fetched sub-plan: "
+                          << root->toString(),
+            !pn->children[0]->fetched());
 
     // This is a ProjectionCoveredNode, so we will be pulling all the data we need from one index.
     // Prepare a bitset to indicate which parts of the index key we need for the projection.
-    std::vector<std::string> keyFieldNames;
     StringSet requiredFields = {pn->proj.getRequiredFields().begin(),
                                 pn->proj.getRequiredFields().end()};
 
@@ -715,17 +960,8 @@ SlotBasedStageBuilder::buildProjectionCovered(const QuerySolutionNode* root,
     // all of the fields that the projection needs.
     auto childReqs = reqs.copy().clear(kResult);
 
-    sbe::IndexKeysInclusionSet indexKeyBitset;
-    size_t i = 0;
-    for (auto&& elt : pn->coveredKeyObj) {
-        if (requiredFields.count(elt.fieldNameStringData())) {
-            indexKeyBitset.set(i);
-            keyFieldNames.push_back(elt.fieldName());
-        }
-
-        ++i;
-    }
-
+    auto [indexKeyBitset, keyFieldNames] =
+        makeIndexKeyInclusionSet(pn->coveredKeyObj, requiredFields);
     childReqs.getIndexKeyBitset() = std::move(indexKeyBitset);
 
     auto [inputStage, outputs] = build(pn->children[0], childReqs);
@@ -902,6 +1138,11 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
         ixscanOutputSlots.push_back(sbe::makeSV(recordIdSlot));
     }
 
+    // If we don't have any index scan stages, produce an EOF plan.
+    if (indexScanList.empty()) {
+        return generateEofPlan(root->nodeId(), reqs, &_slotIdGenerator);
+    }
+
     PlanStageSlots outputs;
 
     // Union will output a slot for the record id and another for the record.
@@ -970,24 +1211,7 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
 
 std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder::buildEof(
     const QuerySolutionNode* root, const PlanStageReqs& reqs) {
-    sbe::value::SlotMap<std::unique_ptr<sbe::EExpression>> projects;
-
-    PlanStageSlots outputs(reqs, &_slotIdGenerator);
-    outputs.forEachSlot(reqs, [&](auto&& slot) {
-        projects.insert({slot, sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Nothing, 0)});
-    });
-
-    auto stage = sbe::makeS<sbe::LimitSkipStage>(
-        sbe::makeS<sbe::CoScanStage>(root->nodeId()), 0, boost::none, root->nodeId());
-
-    if (!projects.empty()) {
-        // Even though this SBE tree will produce zero documents, we still need a ProjectStage to
-        // define the slots in 'outputSlots' so that calls to getAccessor() won't fail.
-        stage =
-            sbe::makeS<sbe::ProjectStage>(std::move(stage), std::move(projects), root->nodeId());
-    }
-
-    return {std::move(stage), std::move(outputs)};
+    return generateEofPlan(root->nodeId(), reqs, &_slotIdGenerator);
 }
 
 std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder::buildAndHash(
@@ -1013,6 +1237,8 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
     auto innerCondSlots = sbe::makeSV(innerIdSlot);
     auto innerProjectSlots = sbe::makeSV(innerResultSlot);
 
+    auto collatorSlot = _data.env->getSlotIfExists("collator"_sd);
+
     // Designate outputs.
     PlanStageSlots outputs(reqs, &_slotIdGenerator);
     if (reqs.has(kRecordId)) {
@@ -1028,6 +1254,7 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
                                                         outerProjectSlots,
                                                         innerCondSlots,
                                                         innerProjectSlots,
+                                                        collatorSlot,
                                                         root->nodeId());
 
     // If there are more than 2 children, iterate all remaining children and hash
@@ -1047,6 +1274,7 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
                                                        projectSlots,
                                                        innerCondSlots,
                                                        innerProjectSlots,
+                                                       collatorSlot,
                                                        root->nodeId());
     }
 
@@ -1127,19 +1355,89 @@ SlotBasedStageBuilder::makeUnionForTailableCollScan(const QuerySolutionNode* roo
     return {std::move(unionStage), std::move(outputs)};
 }
 
+namespace {
+/**
+ * Given an SBE subtree 'childStage' which computes the shard key and puts it into the given
+ * 'shardKeySlot', augments the SBE plan to actually perform shard filtering. Namely, a FilterStage
+ * is added at the root of the tree whose filter expression uses 'shardFilterer' to determine
+ * whether the shard key value in 'shardKeySlot' belongs to an owned range or not.
+ */
+auto buildShardFilterGivenShardKeySlot(sbe::value::SlotId shardKeySlot,
+                                       std::unique_ptr<sbe::PlanStage> childStage,
+                                       std::unique_ptr<ShardFilterer> shardFilterer,
+                                       PlanNodeId nodeId) {
+    auto shardFilterFn =
+        makeFunction("shardFilter",
+                     makeConstant(sbe::value::TypeTags::shardFilterer,
+                                  sbe::value::bitcastFrom<ShardFilterer*>(shardFilterer.release())),
+                     sbe::makeE<sbe::EVariable>(shardKeySlot));
+
+    return sbe::makeS<sbe::FilterStage<false>>(
+        std::move(childStage), std::move(shardFilterFn), nodeId);
+}
+}  // namespace
+
+std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots>
+SlotBasedStageBuilder::buildShardFilterCovered(const ShardingFilterNode* filterNode,
+                                               std::unique_ptr<ShardFilterer> shardFilterer,
+                                               BSONObj shardKeyPattern,
+                                               BSONObj indexKeyPattern,
+                                               const QuerySolutionNode* child,
+                                               PlanStageReqs childReqs) {
+    StringDataSet shardKeyFields;
+    for (auto&& shardKeyElt : shardKeyPattern) {
+        shardKeyFields.insert(shardKeyElt.fieldNameStringData());
+    }
+
+    // Save the bit vector describing the fields from the index that our parent requires. The shard
+    // filtering process may require additional fields that are not needed by the parent (for
+    // example, if the parent is projecting field "a" but the shard key is {a: 1, b: 1}). We will
+    // need the parent's reqs later on so that we can hand the correct slot vector for these fields
+    // back to our parent.
+    auto parentIndexKeyReqs = childReqs.getIndexKeyBitset();
+
+    // Determine the set of fields from the index required to obtain the shard key and union those
+    // with the set of fields from the index required by the parent stage.
+    auto [shardKeyIndexReqs, projectFields] =
+        makeIndexKeyInclusionSet(indexKeyPattern, shardKeyFields);
+    childReqs.getIndexKeyBitset() =
+        parentIndexKeyReqs.value_or(sbe::IndexKeysInclusionSet{}) | shardKeyIndexReqs;
+
+    auto [stage, outputs] = build(child, childReqs);
+
+    invariant(outputs.getIndexKeySlots());
+    auto indexKeySlots = *outputs.getIndexKeySlots();
+
+    auto shardKeySlot = _slotIdGenerator.generate();
+
+    auto mkObjStage = sbe::makeS<sbe::MakeBsonObjStage>(std::move(stage),
+                                                        shardKeySlot,
+                                                        boost::none,
+                                                        boost::none,
+                                                        std::vector<std::string>{},
+                                                        std::move(projectFields),
+                                                        indexKeySlots,
+                                                        true,
+                                                        false,
+                                                        filterNode->nodeId());
+
+    auto filterStage = buildShardFilterGivenShardKeySlot(
+        shardKeySlot, std::move(mkObjStage), std::move(shardFilterer), filterNode->nodeId());
+
+    outputs.setIndexKeySlots(!parentIndexKeyReqs ? boost::none
+                                                 : boost::optional<sbe::value::SlotVector>{
+                                                       makeIndexKeyOutputSlotsMatchingParentReqs(
+                                                           indexKeyPattern,
+                                                           *parentIndexKeyReqs,
+                                                           *childReqs.getIndexKeyBitset(),
+                                                           indexKeySlots)});
+
+    return {std::move(filterStage), std::move(outputs)};
+}
+
 std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder::buildShardFilter(
     const QuerySolutionNode* root, const PlanStageReqs& reqs) {
-    using namespace std::literals;
-
     const auto filterNode = static_cast<const ShardingFilterNode*>(root);
-
-    uassert(5071201,
-            "STAGE_SHARD_FILTER is curently only supported in SBE for collection scan plans",
-            filterNode->children[0]->getType() == StageType::STAGE_COLLSCAN ||
-                filterNode->children[0]->getType() == StageType::STAGE_VIRTUAL_SCAN);
-
-    auto childReqs = reqs.copy().set(kResult);
-    auto [stage, outputs] = build(filterNode->children[0], childReqs);
 
     // If we're sharded make sure that we don't return data that isn't owned by the shard. This
     // situation can occur when pending documents from in-progress migrations are inserted and when
@@ -1147,6 +1445,41 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
     // the shard, we need to own a 'ShardFilterer', and extract the document's shard key as a
     // BSONObj.
     auto shardFilterer = _shardFiltererFactory->makeShardFilterer(_opCtx);
+    auto shardKeyPattern = shardFilterer->getKeyPattern().toBSON();
+
+    // Determine if our child is an index scan and extract it's key pattern, or empty BSONObj if our
+    // child is not an IXSCAN node.
+    BSONObj indexKeyPattern = [&]() {
+        auto childNode = filterNode->children[0];
+        switch (childNode->getType()) {
+            case StageType::STAGE_IXSCAN:
+                return static_cast<const IndexScanNode*>(childNode)->index.keyPattern;
+            case StageType::STAGE_VIRTUAL_SCAN:
+                return static_cast<const VirtualScanNode*>(childNode)->indexKeyPattern;
+            default:
+                return BSONObj{};
+        }
+    }();
+
+    // If we're not required to fill out the 'kResult' slot, then instead we can request a slot from
+    // the child for each of the fields which constitute the shard key. This allows us to avoid
+    // materializing an intermediate object for plans where shard filtering can be performed based
+    // on the contents of index keys.
+    //
+    // We only apply this optimization in the special case that the child QSN is an IXSCAN, since in
+    // this case we can request exactly the fields we need according to their position in the index
+    // key pattern.
+    auto childReqs = reqs.copy().setIf(kResult, indexKeyPattern.isEmpty());
+    if (!childReqs.has(kResult)) {
+        return buildShardFilterCovered(filterNode,
+                                       std::move(shardFilterer),
+                                       std::move(shardKeyPattern),
+                                       std::move(indexKeyPattern),
+                                       filterNode->children[0],
+                                       std::move(childReqs));
+    }
+
+    auto [stage, outputs] = build(filterNode->children[0], childReqs);
 
     // Build an expression to extract the shard key from the document based on the shard key
     // pattern. To do this, we iterate over the shard key pattern parts and build nested 'getField'
@@ -1156,8 +1489,7 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
     std::vector<std::string> projectFields;
     std::unique_ptr<sbe::EExpression> bindShardKeyPart;
 
-    BSONObjIterator keyPatternIter(shardFilterer->getKeyPattern().toBSON());
-    while (auto keyPatternElem = keyPatternIter.next()) {
+    for (auto&& keyPatternElem : shardKeyPattern) {
         auto fieldRef = FieldRef{keyPatternElem.fieldNameStringData()};
         fieldSlots.push_back(_slotIdGenerator.generate());
         projectFields.push_back(fieldRef.dottedField().toString());
@@ -1172,7 +1504,7 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
     auto shardKeySlot{_slotIdGenerator.generate()};
 
     // Build an object which will hold a flattened shard key from the projections above.
-    auto shardKeyObjStage = sbe::makeS<sbe::MakeObjStage>(
+    auto shardKeyObjStage = sbe::makeS<sbe::MakeBsonObjStage>(
         sbe::makeS<sbe::ProjectStage>(std::move(stage), std::move(projections), root->nodeId()),
         shardKeySlot,
         boost::none,
@@ -1204,18 +1536,10 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
     auto finalShardKeyObjStage = makeProjectStage(
         std::move(shardKeyObjStage), root->nodeId(), finalShardKeySlot, std::move(arrayChecks));
 
-    // Build a 'FilterStage' to skip over documents that don't belong to the shard. Shard membership
-    // of the document is checked by invoking 'shardFilter' with the owned 'ShardFilterer' along
-    // with the shard key that sits in the 'finalShardKeySlot' of 'MakeObjStage'.
-    auto shardFilterFn = sbe::makeE<sbe::EFunction>(
-        "shardFilter"sv,
-        sbe::makeEs(sbe::makeE<sbe::EConstant>(
-                        sbe::value::TypeTags::shardFilterer,
-                        sbe::value::bitcastFrom<ShardFilterer*>(shardFilterer.release())),
-                    sbe::makeE<sbe::EVariable>(finalShardKeySlot)));
-
-    return {sbe::makeS<sbe::FilterStage<false>>(
-                std::move(finalShardKeyObjStage), std::move(shardFilterFn), root->nodeId()),
+    return {buildShardFilterGivenShardKeySlot(finalShardKeySlot,
+                                              std::move(finalShardKeyObjStage),
+                                              std::move(shardFilterer),
+                                              root->nodeId()),
             std::move(outputs)};
 }
 
@@ -1248,8 +1572,8 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
             {STAGE_SORT_MERGE, &SlotBasedStageBuilder::buildSortMerge},
             {STAGE_SHARDING_FILTER, &SlotBasedStageBuilder::buildShardFilter}};
 
-    uassert(4822884,
-            str::stream() << "Can't build exec tree for node: " << root->toString(),
+    tassert(4822884,
+            str::stream() << "Unsupported QSN in SBE stage builder: " << root->toString(),
             kStageBuilders.find(root->getType()) != kStageBuilders.end());
 
     // If this plan is for a tailable cursor scan, and we're not already in the process of building
@@ -1261,7 +1585,7 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
         case STAGE_COLLSCAN:
         case STAGE_LIMIT:
         case STAGE_SKIP:
-            if (_cq.getQueryRequest().isTailable() &&
+            if (_cq.getFindCommand().getTailable() &&
                 !reqs.getIsBuildingUnionForTailableCollScan()) {
                 auto childReqs = reqs;
                 childReqs.setIsBuildingUnionForTailableCollScan(true);

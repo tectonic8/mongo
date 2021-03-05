@@ -37,7 +37,6 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/s/create_collection_coordinator.h"
-#include "mongo/db/s/dist_lock_manager.h"
 #include "mongo/db/s/shard_collection_legacy.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/logv2/log.h"
@@ -216,8 +215,6 @@ public:
                     request().getShardKey());
 
             bool useNewPath = [&] {
-                // TODO (SERVER-53092): Use the FCV lock in order to "reserve" operation as running
-                // in new or legacy mode
                 return feature_flags::gShardingFullDDLSupport.isEnabled(
                            serverGlobalParams.featureCompatibility) &&
                     !feature_flags::gDisableIncompleteShardingDDLSupport.isEnabled(

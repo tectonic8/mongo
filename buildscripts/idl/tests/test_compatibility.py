@@ -55,10 +55,47 @@ class TestIDLCompatibilityChecker(unittest.TestCase):
     def test_should_abort(self):
         """Tests that invalid old and new IDL commands should cause script to abort."""
         dir_path = path.dirname(path.realpath(__file__))
+        # Test that when old command has a reply field with an invalid reply type, the script aborts.
         with self.assertRaises(SystemExit):
             idl_check_compatibility.check_compatibility(
-                path.join(dir_path, "compatibility_test_fail/old_abort"),
-                path.join(dir_path, "compatibility_test_fail/new_abort"), ["src"])
+                path.join(dir_path, "compatibility_test_fail/abort/invalid_reply_field_type"),
+                path.join(dir_path, "compatibility_test_fail/abort/valid_reply_field_type"),
+                ["src"])
+
+        # Test that when new command has a reply field with an invalid reply type, the script aborts.
+        with self.assertRaises(SystemExit):
+            idl_check_compatibility.check_compatibility(
+                path.join(dir_path, "compatibility_test_fail/abort/valid_reply_field_type"),
+                path.join(dir_path, "compatibility_test_fail/abort/invalid_reply_field_type"),
+                ["src"])
+
+        # Test that when new command has a parameter with an invalid type, the script aborts.
+        with self.assertRaises(SystemExit):
+            idl_check_compatibility.check_compatibility(
+                path.join(dir_path, "compatibility_test_fail/abort/invalid_command_parameter_type"),
+                path.join(dir_path, "compatibility_test_fail/abort/valid_command_parameter_type"),
+                ["src"])
+
+        # Test that when new command has a parameter with an invalid type, the script aborts.
+        with self.assertRaises(SystemExit):
+            idl_check_compatibility.check_compatibility(
+                path.join(dir_path, "compatibility_test_fail/abort/valid_command_parameter_type"),
+                path.join(dir_path, "compatibility_test_fail/abort/invalid_command_parameter_type"),
+                ["src"])
+
+        # Test that when old command has a reply field that contains a validator, the script aborts.
+        with self.assertRaises(SystemExit):
+            idl_check_compatibility.check_compatibility(
+                path.join(dir_path, "compatibility_test_fail/abort/reply_field_contains_validator"),
+                path.join(dir_path, "compatibility_test_fail/abort/reply_field_no_validator"),
+                ["src"])
+
+        # Test that when new command has a reply field that contains a validator, the script aborts.
+        with self.assertRaises(SystemExit):
+            idl_check_compatibility.check_compatibility(
+                path.join(dir_path, "compatibility_test_fail/abort/reply_field_no_validator"),
+                path.join(dir_path, "compatibility_test_fail/abort/reply_field_contains_validator"),
+                ["src"])
 
     # pylint: disable=too-many-locals,too-many-statements
     def test_should_fail(self):
@@ -69,7 +106,7 @@ class TestIDLCompatibilityChecker(unittest.TestCase):
             path.join(dir_path, "compatibility_test_fail/new"), ["src"])
 
         self.assertTrue(error_collection.has_errors())
-        self.assertTrue(error_collection.count() == 34)
+        self.assertTrue(error_collection.count() == 58)
 
         invalid_api_version_new_error = error_collection.get_error_by_command_name(
             "invalidAPIVersionNew")
@@ -98,6 +135,101 @@ class TestIDLCompatibilityChecker(unittest.TestCase):
         removed_command_error = error_collection.get_error_by_error_id(
             idl_compatibility_errors.ERROR_ID_REMOVED_COMMAND)
         self.assertRegex(str(removed_command_error), "removedCommand")
+
+        removed_command_parameter_error = error_collection.get_error_by_command_name(
+            "removedCommandParameter")
+        self.assertTrue(removed_command_parameter_error.error_id ==
+                        idl_compatibility_errors.ERROR_ID_REMOVED_COMMAND_PARAMETER)
+        self.assertRegex(str(removed_command_parameter_error), "removedCommandParameter")
+
+        added_required_command_parameter_error = error_collection.get_error_by_command_name(
+            "addedNewCommandParameterRequired")
+        self.assertTrue(added_required_command_parameter_error.error_id ==
+                        idl_compatibility_errors.ERROR_ID_ADDED_REQUIRED_COMMAND_PARAMETER)
+        self.assertRegex(
+            str(added_required_command_parameter_error), "addedNewCommandParameterRequired")
+
+        command_parameter_unstable_error = error_collection.get_error_by_command_name(
+            "commandParameterUnstable")
+        self.assertTrue(command_parameter_unstable_error.error_id ==
+                        idl_compatibility_errors.ERROR_ID_COMMAND_PARAMETER_UNSTABLE)
+        self.assertRegex(str(command_parameter_unstable_error), "commandParameterUnstable")
+
+        command_parameter_stable_required_error = error_collection.get_error_by_command_name(
+            "commandParameterStableRequired")
+        self.assertTrue(command_parameter_stable_required_error.error_id ==
+                        idl_compatibility_errors.ERROR_ID_COMMAND_PARAMETER_STABLE_REQUIRED)
+        self.assertRegex(
+            str(command_parameter_stable_required_error), "commandParameterStableRequired")
+
+        command_parameter_required_error = error_collection.get_error_by_command_name(
+            "commandParameterRequired")
+        self.assertTrue(command_parameter_required_error.error_id ==
+                        idl_compatibility_errors.ERROR_ID_COMMAND_PARAMETER_REQUIRED)
+        self.assertRegex(str(command_parameter_required_error), "commandParameterRequired")
+
+        old_command_parameter_type_bson_any_error = error_collection.get_error_by_command_name(
+            "oldCommandParameterTypeBsonSerializationAny")
+        self.assertTrue(
+            old_command_parameter_type_bson_any_error.error_id == idl_compatibility_errors.
+            ERROR_ID_OLD_COMMAND_PARAMETER_TYPE_BSON_SERIALIZATION_TYPE_ANY)
+        self.assertRegex(
+            str(old_command_parameter_type_bson_any_error),
+            "oldCommandParameterTypeBsonSerializationAny")
+
+        new_command_parameter_type_bson_any_error = error_collection.get_error_by_command_name(
+            "newCommandParameterTypeBsonSerializationAny")
+        self.assertTrue(
+            new_command_parameter_type_bson_any_error.error_id == idl_compatibility_errors.
+            ERROR_ID_NEW_COMMAND_PARAMETER_TYPE_BSON_SERIALIZATION_TYPE_ANY)
+        self.assertRegex(
+            str(new_command_parameter_type_bson_any_error),
+            "newCommandParameterTypeBsonSerializationAny")
+
+        new_command_parameter_type_enum_not_superset = error_collection.get_error_by_command_name(
+            "newCommandParameterTypeEnumNotSuperset")
+        self.assertTrue(new_command_parameter_type_enum_not_superset.error_id ==
+                        idl_compatibility_errors.ERROR_ID_COMMAND_PARAMETER_TYPE_NOT_SUPERSET)
+        self.assertRegex(
+            str(new_command_parameter_type_enum_not_superset),
+            "newCommandParameterTypeEnumNotSuperset")
+
+        new_command_parameter_type_not_enum = error_collection.get_error_by_command_name(
+            "newCommandParameterTypeNotEnum")
+        self.assertTrue(new_command_parameter_type_not_enum.error_id ==
+                        idl_compatibility_errors.ERROR_ID_NEW_COMMAND_PARAMETER_TYPE_NOT_ENUM)
+        self.assertRegex(str(new_command_parameter_type_not_enum), "newCommandParameterTypeNotEnum")
+
+        new_command_parameter_type_not_struct = error_collection.get_error_by_command_name(
+            "newCommandParameterTypeNotStruct")
+        self.assertTrue(new_command_parameter_type_not_struct.error_id ==
+                        idl_compatibility_errors.ERROR_ID_NEW_COMMAND_PARAMETER_TYPE_NOT_STRUCT)
+        self.assertRegex(
+            str(new_command_parameter_type_not_struct), "newCommandParameterTypeNotStruct")
+
+        new_command_parameter_type_enum_or_struct_one = error_collection.get_error_by_command_name(
+            "newCommandParameterTypeEnumOrStructOne")
+        self.assertTrue(new_command_parameter_type_enum_or_struct_one.error_id ==
+                        idl_compatibility_errors.ERROR_ID_NEW_COMMAND_PARAMETER_TYPE_ENUM_OR_STRUCT)
+        self.assertRegex(
+            str(new_command_parameter_type_enum_or_struct_one),
+            "newCommandParameterTypeEnumOrStructOne")
+
+        new_command_parameter_type_enum_or_struct_two = error_collection.get_error_by_command_name(
+            "newCommandParameterTypeEnumOrStructTwo")
+        self.assertTrue(new_command_parameter_type_enum_or_struct_two.error_id ==
+                        idl_compatibility_errors.ERROR_ID_NEW_COMMAND_PARAMETER_TYPE_ENUM_OR_STRUCT)
+        self.assertRegex(
+            str(new_command_parameter_type_enum_or_struct_two),
+            "newCommandParameterTypeEnumOrStructTwo")
+
+        new_command_parameter_type_bson_not_superset = error_collection.get_error_by_command_name(
+            "newCommandParameterTypeBsonNotSuperset")
+        self.assertTrue(new_command_parameter_type_bson_not_superset.error_id ==
+                        idl_compatibility_errors.ERROR_ID_COMMAND_PARAMETER_TYPE_NOT_SUPERSET)
+        self.assertRegex(
+            str(new_command_parameter_type_bson_not_superset),
+            "newCommandParameterTypeBsonNotSuperset")
 
         new_reply_field_unstable_error = error_collection.get_error_by_command_name(
             "newReplyFieldUnstable")
@@ -254,6 +386,73 @@ class TestIDLCompatibilityChecker(unittest.TestCase):
         new_type_field_missing_error = error_collection.get_error_by_error_id(
             idl_compatibility_errors.ERROR_ID_NEW_COMMAND_TYPE_FIELD_MISSING)
         self.assertRegex(str(new_type_field_missing_error), "newTypeFieldMissing")
+
+        new_type_field_added_required_error = error_collection.get_error_by_error_id(
+            idl_compatibility_errors.ERROR_ID_NEW_COMMAND_TYPE_FIELD_ADDED_REQUIRED)
+        self.assertRegex(str(new_type_field_added_required_error), "newTypeFieldAddedRequired")
+
+        new_type_field_stable_required_error = error_collection.get_error_by_error_id(
+            idl_compatibility_errors.ERROR_ID_NEW_COMMAND_TYPE_FIELD_STABLE_REQUIRED)
+        self.assertRegex(str(new_type_field_stable_required_error), "newTypeFieldStableRequired")
+
+        new_reply_field_variant_type_error = error_collection.get_error_by_error_id(
+            idl_compatibility_errors.ERROR_ID_NEW_REPLY_FIELD_VARIANT_TYPE)
+        self.assertRegex(str(new_reply_field_variant_type_error), "newReplyFieldVariantType")
+
+        new_reply_field_variant_not_subset_error = error_collection.get_error_by_command_name(
+            "newReplyFieldVariantNotSubset")
+        self.assertTrue(new_reply_field_variant_not_subset_error.error_id ==
+                        idl_compatibility_errors.ERROR_ID_NEW_REPLY_FIELD_VARIANT_TYPE_NOT_SUBSET)
+        self.assertRegex(
+            str(new_reply_field_variant_not_subset_error), "newReplyFieldVariantNotSubset")
+
+        new_reply_field_variant_recursive_error = error_collection.get_error_by_command_name(
+            "replyFieldVariantRecursive")
+        self.assertTrue(new_reply_field_variant_recursive_error.error_id ==
+                        idl_compatibility_errors.ERROR_ID_COMMAND_NOT_SUBSET)
+        self.assertRegex(str(new_reply_field_variant_recursive_error), "replyFieldVariantRecursive")
+
+        new_reply_field_variant_struct_not_subset_error = error_collection.get_error_by_command_name(
+            "newReplyFieldVariantStructNotSubset")
+        self.assertTrue(new_reply_field_variant_struct_not_subset_error.error_id ==
+                        idl_compatibility_errors.ERROR_ID_NEW_REPLY_FIELD_VARIANT_TYPE_NOT_SUBSET)
+        self.assertRegex(
+            str(new_reply_field_variant_struct_not_subset_error),
+            "newReplyFieldVariantStructNotSubset")
+
+        new_reply_field_variant_struct_recursive_error = error_collection.get_error_by_command_name(
+            "replyFieldVariantStructRecursive")
+        self.assertTrue(new_reply_field_variant_struct_recursive_error.error_id ==
+                        idl_compatibility_errors.ERROR_ID_COMMAND_NOT_SUBSET)
+        self.assertRegex(
+            str(new_reply_field_variant_struct_recursive_error), "replyFieldVariantStructRecursive")
+
+        new_command_parameter_contains_validator_error = error_collection.get_error_by_command_name(
+            "newCommandParameterValidator")
+        self.assertTrue(new_command_parameter_contains_validator_error.error_id ==
+                        idl_compatibility_errors.ERROR_ID_COMMAND_PARAMETER_CONTAINS_VALIDATOR)
+        self.assertRegex(
+            str(new_command_parameter_contains_validator_error), "newCommandParameterValidator")
+
+        command_parameter_validators_not_equal_error = error_collection.get_error_by_command_name(
+            "commandParameterValidatorsNotEqual")
+        self.assertTrue(command_parameter_validators_not_equal_error.error_id ==
+                        idl_compatibility_errors.ERROR_ID_COMMAND_PARAMETER_VALIDATORS_NOT_EQUAL)
+        self.assertRegex(
+            str(command_parameter_validators_not_equal_error), "commandParameterValidatorsNotEqual")
+
+        new_command_type_contains_validator_error = error_collection.get_error_by_command_name(
+            "newCommandTypeValidator")
+        self.assertTrue(new_command_type_contains_validator_error.error_id ==
+                        idl_compatibility_errors.ERROR_ID_COMMAND_TYPE_CONTAINS_VALIDATOR)
+        self.assertRegex(str(new_command_type_contains_validator_error), "newCommandTypeValidator")
+
+        command_type_validators_not_equal_error = error_collection.get_error_by_command_name(
+            "commandTypeValidatorsNotEqual")
+        self.assertTrue(command_type_validators_not_equal_error.error_id ==
+                        idl_compatibility_errors.ERROR_ID_COMMAND_TYPE_VALIDATORS_NOT_EQUAL)
+        self.assertRegex(
+            str(command_type_validators_not_equal_error), "commandTypeValidatorsNotEqual")
 
     def test_error_reply(self):
         """Tests the compatibility checker with the ErrorReply struct."""

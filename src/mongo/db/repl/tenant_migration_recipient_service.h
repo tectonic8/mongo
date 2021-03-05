@@ -32,6 +32,7 @@
 #include <boost/optional.hpp>
 #include <memory>
 
+#include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/repl/oplog_fetcher.h"
 #include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/repl/tenant_all_database_cloner.h"
@@ -143,14 +144,20 @@ public:
         OpTime waitUntilMigrationReachesConsistentState(OperationContext* opCtx) const;
 
         /*
-         * Blocks the thread until the tenant oplog applier applied data past the given 'donorTs'
-         * in an interruptible mode. Returns the majority applied donor optime which may be greater
-         * or equal to given 'donorTs'. If the recipient's logical clock has not yet reached the
-         * 'donorTs', advance the recipient's logical clock to 'donorTs' and guarantee durability by
-         * applying a noop write. Throws exception on error.
+         * Blocks the thread until the tenant oplog applier applied data past the
+         * 'returnAfterReachingTimestamp' in an interruptible mode. If the recipient's logical clock
+         * has not yet reached the 'returnAfterReachingTimestamp', advances the recipient's logical
+         * clock to 'returnAfterReachingTimestamp'. Finally, stores the
+         * 'returnAfterReachingTimestamp' as 'rejectReadsBeforeTimestamp' in the state
+         * document and waits for the write to be replicated to every node (i.e. wait for
+         * 'rejectReadsBeforeTimestamp' to be set on the TenantMigrationRecipientAccessBlocker of
+         * every node) to guarantee that no reads will be incorrectly accepted.
+         *
+         * Throws IllegalOperation if the state document already has 'rejectReadsBeforeTimestamp'
+         * that is not equal to 'returnAfterReachingTimestamp', and on other error.
          */
-        OpTime waitUntilTimestampIsMajorityCommitted(OperationContext* opCtx,
-                                                     const Timestamp& donorTs) const;
+        OpTime waitUntilMigrationReachesReturnAfterReachingTimestamp(
+            OperationContext* opCtx, const Timestamp& returnAfterReachingTimestamp);
 
         /*
          *  Set the oplog creator functor, to allow use of a mock oplog fetcher.
@@ -174,6 +181,10 @@ public:
         void excludeDonorHost_forTest(const HostAndPort& host, Date_t until) {
             stdx::lock_guard lk(_mutex);
             _excludeDonorHost(lk, host, until);
+        }
+
+        const auto& getExcludedDonorHosts_forTest() {
+            return _excludedDonorHosts;
         }
 
     private:
@@ -205,23 +216,39 @@ public:
                     case kRunning:
                         return newState == kInterrupted || newState == kDone;
                     case kInterrupted:
-                        return newState == kDone;
+                        return newState == kDone || newState == kRunning;
                     case kDone:
                         return false;
                 }
                 MONGO_UNREACHABLE;
             }
 
-            void setState(StateFlag state, boost::optional<Status> interruptStatus = boost::none) {
+            void setState(StateFlag state,
+                          boost::optional<Status> interruptStatus = boost::none,
+                          bool isExternalInterrupt = false) {
                 invariant(checkIfValidTransition(state),
                           str::stream() << "current state: " << toString(_state)
                                         << ", new state: " << toString(state));
 
+                // The interruptStatus can exist (and should be non-OK) if and only if the state is
+                // kInterrupted.
+                invariant((state == kInterrupted && interruptStatus && !interruptStatus->isOK()) ||
+                              (state != kInterrupted && !interruptStatus),
+                          str::stream() << "new state: " << toString(state)
+                                        << ", interruptStatus: " << interruptStatus);
+
                 _state = state;
-                if (interruptStatus) {
-                    invariant(_state == kInterrupted && !interruptStatus->isOK());
-                    _interruptStatus = interruptStatus.get();
-                }
+                _interruptStatus = (interruptStatus) ? interruptStatus.get() : _interruptStatus;
+                _isExternalInterrupt = isExternalInterrupt;
+            }
+
+            void clearInterruptStatus() {
+                _interruptStatus = Status{ErrorCodes::InternalError, "Uninitialized value"};
+                _isExternalInterrupt = false;
+            }
+
+            bool isExternalInterrupt() const {
+                return (_state == kInterrupted) && _isExternalInterrupt;
             }
 
             bool isNotStarted() const {
@@ -265,8 +292,12 @@ public:
         private:
             // task state.
             StateFlag _state = kNotStarted;
-            // task interrupt status.
-            Status _interruptStatus = Status{ErrorCodes::InternalError, "Uninitialized value"};
+            // task interrupt status. Set to Status::OK() only when the recipient service has not
+            // been interrupted so far, and is used to remember the initial interrupt error.
+            Status _interruptStatus = Status::OK();
+            // Indicates if the task was interrupted externally due to a 'recipientForgetMigration'
+            // or stepdown/shutdown.
+            bool _isExternalInterrupt = false;
         };
 
         /*
@@ -310,7 +341,7 @@ public:
 
         /**
          * Fetches all key documents from the donor's admin.system.keys collection, stores them in
-         * admin.system.external_validation_keys, and refreshes the keys cache.
+         * config.external_validation_keys, and refreshes the keys cache.
          */
         void _fetchAndStoreDonorClusterTimeKeyDocs(const CancelationToken& token);
 
@@ -330,6 +361,12 @@ public:
                                  const OplogFetcher::DocumentsInfo& info);
 
         /**
+         * Creates the oplog buffer that will be populated by donor oplog entries from the retryable
+         * writes fetching stage and oplog fetching stage.
+         */
+        void _createOplogBuffer();
+
+        /**
          * Runs an aggregation that gets the entire oplog chain for every retryable write entry in
          * `config.transactions` with `lastWriteOpTime` < `startFetchingOpTime`. Adds these oplog
          * entries to the oplog buffer.
@@ -337,10 +374,23 @@ public:
         void _fetchRetryableWritesOplogBeforeStartOpTime();
 
         /**
-         * Runs an aggregation that gets the donor's transactions entries in 'config.transactions'
-         * with 'lastWriteOpTime' < 'startFetchingOpTime' and 'state: committed'.
+         * Runs the aggregation from '_makeCommittedTransactionsAggregation()' and migrates the
+         * resulting committed transactions entries into 'config.transactions'.
          */
         void _fetchCommittedTransactionsBeforeStartOpTime();
+
+        /**
+         * Creates an aggregation pipeline to fetch transaction entries with 'lastWriteOpTime' <
+         * 'startFetchingDonorOpTime' and 'state: committed'.
+         */
+        AggregateCommand _makeCommittedTransactionsAggregation() const;
+
+        /**
+         * Processes a committed transaction entry from the donor. Updates the recipient's
+         * 'config.transactions' collection with the entry and writes a no-op entry for the
+         * recipient secondaries to replicate the entry.
+         */
+        void _processCommittedTransactionEntry(const BSONObj& entry);
 
         /**
          * Starts the tenant oplog fetcher.
@@ -413,9 +463,10 @@ public:
         std::vector<HostAndPort> _getExcludedDonorHosts(WithLock);
 
         /*
-         * Makes the failpoint to stop or hang based on failpoint data "action" field.
+         * Makes the failpoint stop or hang the migration based on failpoint data "action" field.
+         * If "action" is "hang" and 'opCtx' is not null, the failpoint will be interruptible.
          */
-        void _stopOrHangOnFailPoint(FailPoint* fp);
+        void _stopOrHangOnFailPoint(FailPoint* fp, OperationContext* opCtx = nullptr);
 
         /**
          * Updates the state doc in the database and waits for that to be propagated to a majority.
@@ -468,8 +519,10 @@ public:
         // Because the cloners and oplog fetcher use exhaust, we need a separate connection for
         // each.  The '_client' will be used for the cloners and other operations such as fetching
         // optimes while the '_oplogFetcherClient' will be reserved for the oplog fetcher only.
-        std::unique_ptr<DBClientConnection> _client;              // (M)
-        std::unique_ptr<DBClientConnection> _oplogFetcherClient;  // (M)
+        //
+        // Follow DBClientCursor synchonization rules.
+        std::unique_ptr<DBClientConnection> _client;              // (S)
+        std::unique_ptr<DBClientConnection> _oplogFetcherClient;  // (S)
 
         std::unique_ptr<OplogFetcherFactory> _createOplogFetcherFn =
             std::make_unique<CreateOplogFetcherFn>();                               // (M)
@@ -486,6 +539,8 @@ public:
         std::unique_ptr<TenantMigrationSharedData> _sharedData;  // (S)
         // Indicates whether the main task future continuation chain state kicked off by run().
         TaskState _taskState;  // (M)
+        // Used to indicate whether the migration is able to be retried on fetcher error.
+        boost::optional<Status> _oplogFetcherStatus;  // (M)
 
         // Promise that is resolved when the state document is initialized and persisted.
         SharedPromise<void> _stateDocPersistedPromise;  // (W)

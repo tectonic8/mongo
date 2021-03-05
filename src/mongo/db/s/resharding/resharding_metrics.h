@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#pragma once
+
 #include <boost/optional.hpp>
 
 #include "mongo/bson/bsonobj.h"
@@ -39,6 +41,8 @@
 #include "mongo/util/duration.h"
 #include "mongo/util/uuid.h"
 
+#pragma once
+
 namespace mongo {
 
 /*
@@ -50,7 +54,7 @@ public:
     ReshardingMetrics(const ReshardingMetrics&) = delete;
     ReshardingMetrics(ReshardingMetrics&&) = delete;
 
-    ReshardingMetrics(ServiceContext* svcCtx) : _svcCtx(svcCtx) {}
+    explicit ReshardingMetrics(ServiceContext* svcCtx) : _svcCtx(svcCtx) {}
 
     static ReshardingMetrics* get(ServiceContext*) noexcept;
 
@@ -64,8 +68,9 @@ public:
     void setRecipientState(RecipientStateEnum) noexcept;
     void setCoordinatorState(CoordinatorStateEnum) noexcept;
 
-    // Allows updating metrics on "documents to copy" so long as the recipient is in cloning state.
+    // Set by donors.
     void setDocumentsToCopy(int64_t documents, int64_t bytes) noexcept;
+    // Allows updating metrics on "documents to copy" so long as the recipient is in cloning state.
     void onDocumentsCopied(int64_t documents, int64_t bytes) noexcept;
 
     // Allows updating "oplog entries to apply" metrics when the recipient is in applying state.
@@ -73,7 +78,7 @@ public:
     void onOplogEntriesApplied(int64_t entries) noexcept;
 
     // Allows tracking writes during a critical section when the donor's state is either of
-    // "preparing-to-mirror" or "mirroring".
+    // "preparing-to-block-writes" or "blocking-writes".
     void onWriteDuringCriticalSection(int64_t writes) noexcept;
 
     // Marks the completion of the current (active) resharding operation. Aborts the process if no
@@ -99,6 +104,9 @@ public:
     BSONObj reportForCurrentOp(const ReporterOptions& options) const noexcept;
 
     void serialize(BSONObjBuilder*, ReporterOptions::Role role = ReporterOptions::Role::kAll) const;
+
+    // Reports the elapsed time for the active resharding operation, or `boost::none`.
+    boost::optional<Milliseconds> getOperationElapsedTime() const;
 
 private:
     ServiceContext* const _svcCtx;

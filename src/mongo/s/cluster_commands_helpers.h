@@ -133,11 +133,6 @@ BSONObj appendDbVersionIfPresent(BSONObj cmdObj, DatabaseVersion dbVersion);
 BSONObj appendShardVersion(BSONObj cmdObj, ChunkVersion version);
 
 /**
- * Returns a copy of 'cmdObj' with 'allowImplicitCollectionCreation' appended.
- */
-BSONObj appendAllowImplicitCreate(BSONObj cmdObj, bool allow);
-
-/**
  * Returns a copy of 'cmdObj' with the read/writeConcern from the OpCtx appended, unless the
  * cmdObj explicitly specifies read/writeConcern.
  */
@@ -327,12 +322,6 @@ bool appendEmptyResultSet(OperationContext* opCtx,
                           BSONObjBuilder& result,
                           Status status,
                           const std::string& ns);
-
-/**
- * If the specified database exists already, loads it in the cache (if not already there).
- * Otherwise, if it does not exist, this call will implicitly create it as non-sharded.
- */
-void createShardDatabase(OperationContext* opCtx, StringData dbName);
 
 /**
  * Returns the shards that would be targeted for the given query according to the given routing

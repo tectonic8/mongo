@@ -37,6 +37,7 @@
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/s/cluster_ddl.h"
 #include "mongo/s/grid.h"
 
 namespace mongo {
@@ -65,7 +66,7 @@ public:
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
                                std::vector<Privilege>* out) const final {
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), {ActionType::createIndex}));
+        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), ActionType::createIndex));
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const final {
@@ -85,7 +86,7 @@ public:
                     "namespace"_attr = nss,
                     "command"_attr = redact(cmdObj));
 
-        createShardDatabase(opCtx, dbName);
+        cluster::createDatabase(opCtx, dbName);
 
         auto routingInfo =
             uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));

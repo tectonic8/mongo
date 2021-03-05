@@ -38,8 +38,12 @@
 #include "mongo/config.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
 #include "mongo/db/repl/cloner_utils.h"
 #include "mongo/db/repl/data_replicator_external_state.h"
 #include "mongo/db/repl/oplog_applier.h"
@@ -50,11 +54,15 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/replication_auth.h"
+#include "mongo/db/repl/tenant_migration_access_blocker_util.h"
+#include "mongo/db/repl/tenant_migration_decoration.h"
 #include "mongo/db/repl/tenant_migration_recipient_entry_helpers.h"
 #include "mongo/db/repl/tenant_migration_recipient_service.h"
 #include "mongo/db/repl/tenant_migration_state_machine_gen.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
+#include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/session_txn_record_gen.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/db/vector_clock_mutable.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/logv2/log.h"
@@ -73,6 +81,36 @@ NamespaceString getOplogBufferNs(const UUID& migrationUUID) {
     return NamespaceString(NamespaceString::kConfigDb,
                            kOplogBufferPrefix + migrationUUID.toString());
 }
+
+boost::intrusive_ptr<ExpressionContext> makeExpressionContext(OperationContext* opCtx) {
+    StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces;
+
+    // Add kTenantMigrationOplogView, kSessionTransactionsTableNamespace, and kRsOplogNamespace
+    // to resolvedNamespaces since they are all used during different pipeline stages.
+    resolvedNamespaces[NamespaceString::kTenantMigrationOplogView.coll()] = {
+        NamespaceString::kTenantMigrationOplogView, std::vector<BSONObj>()};
+
+    resolvedNamespaces[NamespaceString::kSessionTransactionsTableNamespace.coll()] = {
+        NamespaceString::kSessionTransactionsTableNamespace, std::vector<BSONObj>()};
+
+    resolvedNamespaces[NamespaceString::kRsOplogNamespace.coll()] = {
+        NamespaceString::kRsOplogNamespace, std::vector<BSONObj>()};
+
+    return make_intrusive<ExpressionContext>(opCtx,
+                                             boost::none, /* explain */
+                                             false,       /* fromMongos */
+                                             false,       /* needsMerge */
+                                             true,        /* allowDiskUse */
+                                             true,        /* bypassDocumentValidation */
+                                             false,       /* isMapReduceCommand */
+                                             NamespaceString::kSessionTransactionsTableNamespace,
+                                             boost::none, /* runtimeConstants */
+                                             nullptr,     /* collator */
+                                             MongoProcessInterface::create(opCtx),
+                                             std::move(resolvedNamespaces),
+                                             boost::none); /* collUUID */
+}
+
 }  // namespace
 
 // A convenient place to set test-specific parameters.
@@ -82,6 +120,7 @@ MONGO_FAIL_POINT_DEFINE(skipTenantMigrationRecipientAuth);
 MONGO_FAIL_POINT_DEFINE(skipComparingRecipientAndDonorFCV);
 MONGO_FAIL_POINT_DEFINE(autoRecipientForgetMigration);
 MONGO_FAIL_POINT_DEFINE(pauseAfterCreatingOplogBuffer);
+MONGO_FAIL_POINT_DEFINE(skipFetchingCommittedTransactions);
 
 // Fails before waiting for the state doc to be majority replicated.
 MONGO_FAIL_POINT_DEFINE(failWhilePersistingTenantMigrationRecipientInstanceStateDoc);
@@ -90,16 +129,24 @@ MONGO_FAIL_POINT_DEFINE(fpAfterConnectingTenantMigrationRecipientInstance);
 MONGO_FAIL_POINT_DEFINE(fpAfterRecordingRecipientPrimaryStartingFCV);
 MONGO_FAIL_POINT_DEFINE(fpAfterComparingRecipientAndDonorFCV);
 MONGO_FAIL_POINT_DEFINE(fpAfterRetrievingStartOpTimesMigrationRecipientInstance);
+MONGO_FAIL_POINT_DEFINE(skipFetchingRetryableWritesEntriesBeforeStartOpTime);
+MONGO_FAIL_POINT_DEFINE(fpAfterFetchingRetryableWritesEntriesBeforeStartOpTime);
 MONGO_FAIL_POINT_DEFINE(fpAfterStartingOplogFetcherMigrationRecipientInstance);
 MONGO_FAIL_POINT_DEFINE(setTenantMigrationRecipientInstanceHostTimeout);
 MONGO_FAIL_POINT_DEFINE(pauseAfterRetrievingLastTxnMigrationRecipientInstance);
+MONGO_FAIL_POINT_DEFINE(fpBeforeMarkingCollectionClonerDone);
 MONGO_FAIL_POINT_DEFINE(fpAfterCollectionClonerDone);
 MONGO_FAIL_POINT_DEFINE(fpAfterStartingOplogApplierMigrationRecipientInstance);
+MONGO_FAIL_POINT_DEFINE(fpBeforeFulfillingDataConsistentPromise);
 MONGO_FAIL_POINT_DEFINE(fpAfterDataConsistentMigrationRecipientInstance);
+MONGO_FAIL_POINT_DEFINE(fpBeforePersistingRejectReadsBeforeTimestamp)
+MONGO_FAIL_POINT_DEFINE(fpAfterWaitForRejectReadsBeforeTimestamp);
 MONGO_FAIL_POINT_DEFINE(hangBeforeTaskCompletion);
 MONGO_FAIL_POINT_DEFINE(fpAfterReceivingRecipientForgetMigration);
 MONGO_FAIL_POINT_DEFINE(hangAfterCreatingRSM);
 MONGO_FAIL_POINT_DEFINE(skipRetriesWhenConnectingToDonorHost);
+MONGO_FAIL_POINT_DEFINE(fpBeforeDroppingOplogBufferCollection);
+MONGO_FAIL_POINT_DEFINE(fpWaitUntilTimestampMajorityCommitted);
 
 namespace {
 // We never restart just the oplog fetcher.  If a failure occurs, we restart the whole state machine
@@ -270,6 +317,9 @@ boost::optional<BSONObj> TenantMigrationRecipientService::Instance::reportForCur
     bob.append("state", _stateDoc.getState());
     bob.append("dataSyncCompleted", _dataSyncCompletionPromise.getFuture().isReady());
     bob.append("migrationCompleted", _taskCompletionPromise.getFuture().isReady());
+    bob.append("numRestartsDueToDonorConnectionFailure",
+               _stateDoc.getNumRestartsDueToDonorConnectionFailure());
+    bob.append("numRestartsDueToRecipientFailure", _stateDoc.getNumRestartsDueToRecipientFailure());
 
     if (_stateDoc.getStartFetchingDonorOpTime())
         bob.append("startFetchingDonorOpTime", _stateDoc.getStartFetchingDonorOpTime()->toBSON());
@@ -316,11 +366,25 @@ OpTime TenantMigrationRecipientService::Instance::waitUntilMigrationReachesConsi
     return _dataConsistentPromise.getFuture().get(opCtx);
 }
 
-OpTime TenantMigrationRecipientService::Instance::waitUntilTimestampIsMajorityCommitted(
-    OperationContext* opCtx, const Timestamp& donorTs) const {
+OpTime
+TenantMigrationRecipientService::Instance::waitUntilMigrationReachesReturnAfterReachingTimestamp(
+    OperationContext* opCtx, const Timestamp& returnAfterReachingTimestamp) {
+    // This gives assurance that _tenantOplogApplier pointer won't be empty, and that it has been
+    // started. Additionally, we must have finished processing the recipientSyncData command that
+    // waits on _dataConsistentPromise.
+    _dataConsistentPromise.getFuture().get(opCtx);
 
-    // This gives assurance that _tenantOplogApplier pointer won't be empty.
-    _dataSyncStartedPromise.getFuture().get(opCtx);
+    {
+        stdx::lock_guard lk(_mutex);
+        if (_stateDoc.getRejectReadsBeforeTimestamp()) {
+            uassert(
+                ErrorCodes::IllegalOperation,
+                str::stream() << "Received a conflicting returnAfterReachingTimestamp, received: "
+                              << returnAfterReachingTimestamp.toBSON() << " expected: "
+                              << _stateDoc.getRejectReadsBeforeTimestamp()->toBSON(),
+                returnAfterReachingTimestamp == *_stateDoc.getRejectReadsBeforeTimestamp());
+        }
+    }
 
     auto getWaitOpTimeFuture = [&]() {
         stdx::lock_guard lk(_mutex);
@@ -347,30 +411,48 @@ OpTime TenantMigrationRecipientService::Instance::waitUntilTimestampIsMajorityCo
                 state == TenantMigrationRecipientStateEnum::kConsistent);
 
         return _tenantOplogApplier->getNotificationForOpTime(
-            OpTime(donorTs, OpTime::kUninitializedTerm));
+            OpTime(returnAfterReachingTimestamp, OpTime::kUninitializedTerm));
     };
-    auto donorRecipientOpTimePair = getWaitOpTimeFuture().get(opCtx);
 
-    // We want to guarantee that the recipient logical clock has advanced to at least the donor
-    // timestamp before returning success for recipientSyncData by doing a majority committed noop
-    // write after ticking the recipient clock to the donor timestamp.
+    auto waitOpTimeFuture = getWaitOpTimeFuture();
+    fpWaitUntilTimestampMajorityCommitted.pauseWhileSet();
+    auto swDonorRecipientOpTimePair = waitOpTimeFuture.getNoThrow();
+
+    auto status = swDonorRecipientOpTimePair.getStatus();
+
+    // A cancelation error may occur due to an interrupt. If that is the case, replace the error
+    // code with the interrupt code, the true reason for interruption.
+    if (ErrorCodes::isCancelationError(status)) {
+        stdx::lock_guard lk(_mutex);
+        if (!_taskState.getInterruptStatus().isOK()) {
+            status = _taskState.getInterruptStatus();
+        }
+    }
+
+    uassertStatusOK(status);
+
+    // Make sure that the recipient logical clock has advanced to at least the donor timestamp
+    // before returning success for recipientSyncData.
     // Note: tickClusterTimeTo() will not tick the recipient clock backwards in time.
-    VectorClockMutable::get(opCtx)->tickClusterTimeTo(LogicalTime(donorTs));
+    VectorClockMutable::get(opCtx)->tickClusterTimeTo(LogicalTime(returnAfterReachingTimestamp));
 
-    BSONObj result;
-    DBDirectClient client(opCtx);
-    client.runCommand(NamespaceString::kAdminDb.toString(),
-                      BSON("appendOplogNote" << 1 << "data"
-                                             << BSON("msg"
-                                                     << "Noop write for recipientSyncData")),
-                      result);
-    uassertStatusOK(getStatusFromCommandResult(result));
+    {
+        stdx::lock_guard lk(_mutex);
+        _stateDoc.setRejectReadsBeforeTimestamp(returnAfterReachingTimestamp);
+    }
+    _stopOrHangOnFailPoint(&fpBeforePersistingRejectReadsBeforeTimestamp, opCtx);
+    uassertStatusOK(tenantMigrationRecipientEntryHelpers::updateStateDoc(opCtx, _stateDoc));
 
-    // Wait for the noop write optime to be majority committed.
-    WaitForMajorityService::get(opCtx->getServiceContext())
-        .waitUntilMajority(repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp())
-        .get(opCtx);
-    return donorRecipientOpTimePair.donorOpTime;
+    auto writeOpTime = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
+    auto replCoord = repl::ReplicationCoordinator::get(_serviceContext);
+    WriteConcernOptions writeConcern(repl::ReplSetConfig::kConfigAllWriteConcernName,
+                                     WriteConcernOptions::SyncMode::NONE,
+                                     opCtx->getWriteConcern().wTimeout);
+    uassertStatusOK(replCoord->awaitReplication(opCtx, writeOpTime, writeConcern).status);
+
+    _stopOrHangOnFailPoint(&fpAfterWaitForRejectReadsBeforeTimestamp, opCtx);
+
+    return swDonorRecipientOpTimePair.getValue().donorOpTime;
 }
 
 std::unique_ptr<DBClientConnection> TenantMigrationRecipientService::Instance::_connectAndAuth(
@@ -460,7 +542,6 @@ TenantMigrationRecipientService::Instance::_createAndConnectClients() {
     }
 
     const auto kDelayedMajorityOpTimeErrorCode = 5272000;
-
     return AsyncTry([this,
                      self = shared_from_this(),
                      getHostCancelSource,
@@ -469,7 +550,6 @@ TenantMigrationRecipientService::Instance::_createAndConnectClients() {
 
                // Get all donor hosts that we have excluded.
                const auto& excludedHosts = _getExcludedDonorHosts(lk);
-
                return _donorReplicaSetMonitor
                    ->getHostOrRefresh(_readPreference, excludedHosts, getHostCancelSource.token())
                    .thenRunOn(**_scopedExecutor)
@@ -494,31 +574,46 @@ TenantMigrationRecipientService::Instance::_createAndConnectClients() {
                        auto client = _connectAndAuth(serverAddress, applicationName);
 
                        boost::optional<repl::OpTime> startApplyingOpTime;
+                       Timestamp startMigrationDonorTimestamp;
                        {
                            stdx::lock_guard lk(_mutex);
                            startApplyingOpTime = _stateDoc.getStartApplyingDonorOpTime();
+                           startMigrationDonorTimestamp =
+                               _stateDoc.getStartMigrationDonorTimestamp();
                        }
 
-                       if (startApplyingOpTime) {
-                           auto majoritySnapshotOpTime = _getDonorMajorityOpTime(client);
-
-                           if (majoritySnapshotOpTime < *startApplyingOpTime) {
-                               stdx::lock_guard lk(_mutex);
-                               const auto now =
-                                   getGlobalServiceContext()->getFastClockSource()->now();
-                               _excludeDonorHost(
-                                   lk,
-                                   serverAddress,
-                                   now + Milliseconds(tenantMigrationExcludeDonorHostTimeoutMS));
-                               uasserted(
-                                   kDelayedMajorityOpTimeErrorCode,
-                                   str::stream()
-                                       << "majoritySnapshotOpTime on donor host must not be behind "
-                                          "startApplyingDonorOpTime, majoritySnapshotOpTime: "
-                                       << majoritySnapshotOpTime.toString()
-                                       << "; startApplyingDonorOpTime: "
-                                       << (*startApplyingOpTime).toString());
-                           }
+                       auto majoritySnapshotOpTime = _getDonorMajorityOpTime(client);
+                       if (majoritySnapshotOpTime.getTimestamp() < startMigrationDonorTimestamp) {
+                           stdx::lock_guard lk(_mutex);
+                           const auto now = getGlobalServiceContext()->getFastClockSource()->now();
+                           _excludeDonorHost(
+                               lk,
+                               serverAddress,
+                               now + Milliseconds(tenantMigrationExcludeDonorHostTimeoutMS));
+                           uasserted(
+                               kDelayedMajorityOpTimeErrorCode,
+                               str::stream()
+                                   << "majoritySnapshotOpTime on donor host must not be behind "
+                                      "startMigrationDonorTimestamp, majoritySnapshotOpTime: "
+                                   << majoritySnapshotOpTime.toString()
+                                   << "; startMigrationDonorTimestamp: "
+                                   << startMigrationDonorTimestamp.toString());
+                       }
+                       if (startApplyingOpTime && majoritySnapshotOpTime < *startApplyingOpTime) {
+                           stdx::lock_guard lk(_mutex);
+                           const auto now = getGlobalServiceContext()->getFastClockSource()->now();
+                           _excludeDonorHost(
+                               lk,
+                               serverAddress,
+                               now + Milliseconds(tenantMigrationExcludeDonorHostTimeoutMS));
+                           uasserted(
+                               kDelayedMajorityOpTimeErrorCode,
+                               str::stream()
+                                   << "majoritySnapshotOpTime on donor host must not be behind "
+                                      "startApplyingDonorOpTime, majoritySnapshotOpTime: "
+                                   << majoritySnapshotOpTime.toString()
+                                   << "; startApplyingDonorOpTime: "
+                                   << (*startApplyingOpTime).toString());
                        }
 
                        // Application name is constructed such that it doesn't exceed
@@ -614,12 +709,11 @@ std::vector<HostAndPort> TenantMigrationRecipientService::Instance::_getExcluded
 }
 
 SemiFuture<void> TenantMigrationRecipientService::Instance::_initializeStateDoc(WithLock) {
-    // If the instance state is not 'kUninitialized', then the instance is restarted by step
-    // up. So, skip persisting the state doc. And, PrimaryOnlyService::onStepUp() waits for
-    // majority commit of the primary no-op oplog entry written by the node in the newer
-    // term before scheduling the Instance::run(). So, it's also safe to assume that
-    // instance's state document written in an older term on disk won't get rolled back for
-    // step up case.
+    // If the instance state is not 'kUninitialized', then the instance is restarted by step up. So,
+    // skip persisting the state doc. And, PrimaryOnlyService::onStepUp() waits for majority commit
+    // of the primary no-op oplog entry written by the node in the newer term before scheduling the
+    // Instance::run(). So, it's also safe to assume that instance's state document written in an
+    // older term on disk won't get rolled back for step up case.
     if (_stateDoc.getState() != TenantMigrationRecipientStateEnum::kUninitialized) {
         return SemiFuture<void>::makeReady();
     }
@@ -730,31 +824,244 @@ void TenantMigrationRecipientService::Instance::_getStartOpTimesFromDonor(WithLo
     _stateDoc.setStartFetchingDonorOpTime(startFetchingDonorOpTime);
 }
 
-void TenantMigrationRecipientService::Instance::_fetchRetryableWritesOplogBeforeStartOpTime() {
-    // TODO SERVER-53319: Run the aggregation pipeline on the correct tenant donor's oplog. Move
-    // oplog buffer creation here and add the returned oplog entries to the buffer.
-    return;
+AggregateCommand TenantMigrationRecipientService::Instance::_makeCommittedTransactionsAggregation()
+    const {
+
+    auto opCtx = cc().makeOperationContext();
+    auto expCtx = makeExpressionContext(opCtx.get());
+
+    Timestamp startFetchingTimestamp;
+    {
+        stdx::lock_guard lk(_mutex);
+        invariant(_stateDoc.getStartFetchingDonorOpTime());
+        startFetchingTimestamp = _stateDoc.getStartFetchingDonorOpTime().get().getTimestamp();
+    }
+
+    auto serializedPipeline =
+        tenant_migration_util::createCommittedTransactionsPipelineForTenantMigrations(
+            expCtx, startFetchingTimestamp, getTenantId())
+            ->serializeToBson();
+
+    AggregateCommand aggRequest(NamespaceString::kSessionTransactionsTableNamespace,
+                                std::move(serializedPipeline));
+
+    auto readConcern = repl::ReadConcernArgs(
+        boost::optional<LogicalTime>(startFetchingTimestamp),
+        boost::optional<repl::ReadConcernLevel>(repl::ReadConcernLevel::kMajorityReadConcern));
+    aggRequest.setReadConcern(readConcern.toBSONInner());
+
+    aggRequest.setHint(BSON(SessionTxnRecord::kSessionIdFieldName << 1));
+    aggRequest.setCursor(SimpleCursorOptions());
+    // We must set a writeConcern on internal commands.
+    aggRequest.setWriteConcern(WriteConcernOptions());
+
+    return aggRequest;
+}
+
+void TenantMigrationRecipientService::Instance::_processCommittedTransactionEntry(
+    const BSONObj& entry) {
+    auto sessionTxnRecord =
+        SessionTxnRecord::parse(IDLParserErrorContext("SessionTxnRecord"), entry);
+    auto sessionId = sessionTxnRecord.getSessionId();
+    auto txnNumber = sessionTxnRecord.getTxnNum();
+
+    auto uniqueOpCtx = cc().makeOperationContext();
+    auto opCtx = uniqueOpCtx.get();
+
+    // If the tenantMigrationRecipientInfo is set on the opCtx, we will set the
+    // 'fromTenantMigration' field when writing oplog entries. That field is used to help recipient
+    // secondaries determine if a no-op entry is related to a transaction entry.
+    tenantMigrationRecipientInfo(opCtx) =
+        boost::make_optional<TenantMigrationRecipientInfo>(getMigrationUUID());
+    opCtx->setLogicalSessionId(sessionId);
+    opCtx->setTxnNumber(txnNumber);
+    opCtx->setInMultiDocumentTransaction();
+    MongoDOperationContextSession ocs(opCtx);
+
+    LOGV2_DEBUG(5351301,
+                1,
+                "Migration attempting to commit transaction",
+                "sessionId"_attr = sessionId,
+                "txnNumber"_attr = txnNumber,
+                "tenantId"_attr = getTenantId(),
+                "migrationId"_attr = getMigrationUUID());
+
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    uassert(5351300,
+            str::stream() << "Migration failed to get transaction participant for transaction "
+                          << txnNumber << " on session " << sessionId,
+            txnParticipant);
+
+    // If the entry's transaction number is stale/older than the current active transaction number
+    // on the participant, fail the migration.
+    uassert(ErrorCodes::TransactionTooOld,
+            str::stream() << "Migration cannot apply transaction " << txnNumber << " on session "
+                          << sessionId << " because a newer transaction "
+                          << txnParticipant.getActiveTxnNumber() << " has already started",
+            txnParticipant.getActiveTxnNumber() < txnNumber);
+    if (txnParticipant.getActiveTxnNumber() == txnNumber) {
+        // If the txn numbers are equal, move on to the next entry.
+        return;
+    }
+
+    txnParticipant.beginOrContinueTransactionUnconditionally(opCtx, txnNumber);
+
+    MutableOplogEntry noopEntry;
+    noopEntry.setOpType(repl::OpTypeEnum::kNoop);
+    noopEntry.setNss({});
+    noopEntry.setObject({});
+    noopEntry.setWallClockTime(opCtx->getServiceContext()->getFastClockSource()->now());
+    noopEntry.setSessionId(sessionId);
+    noopEntry.setTxnNumber(txnNumber);
+
+    // Use the same wallclock time as the noop entry.
+    sessionTxnRecord.setStartOpTime(boost::none);
+    sessionTxnRecord.setLastWriteOpTime(OpTime());
+    sessionTxnRecord.setLastWriteDate(noopEntry.getWallClockTime());
+
+    AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
+    writeConflictRetry(
+        opCtx, "writeDonorCommittedTxnEntry", NamespaceString::kRsOplogNamespace.ns(), [&] {
+            WriteUnitOfWork wuow(opCtx);
+
+            // Write the no-op entry and update 'config.transactions'.
+            repl::logOp(opCtx, &noopEntry);
+            TransactionParticipant::get(opCtx).onWriteOpCompletedOnPrimary(
+                opCtx, {}, sessionTxnRecord);
+
+            wuow.commit();
+        });
+
+    // Invalidate in-memory state so that the next time the session is checked out, it would reload
+    // the transaction state from 'config.transactions'.
+    txnParticipant.invalidate(opCtx);
 }
 
 void TenantMigrationRecipientService::Instance::_fetchCommittedTransactionsBeforeStartOpTime() {
-    // TODO (SERVER-53511): Run the aggregation.
-    return;
+    if (MONGO_unlikely(skipFetchingCommittedTransactions.shouldFail())) {  // Test-only.
+        return;
+    }
+
+    auto aggRequest = _makeCommittedTransactionsAggregation();
+
+    auto statusWith = DBClientCursor::fromAggregationRequest(
+        _client.get(), std::move(aggRequest), true /* secondaryOk */, false /* useExhaust */);
+    if (!statusWith.isOK()) {
+        LOGV2_ERROR(5351100,
+                    "Fetch committed transactions aggregation failed",
+                    "error"_attr = statusWith.getStatus());
+        uassertStatusOK(statusWith.getStatus());
+    }
+
+    auto cursor = statusWith.getValue().get();
+    while (cursor->more()) {
+        auto transactionEntry = cursor->next();
+        _processCommittedTransactionEntry(transactionEntry);
+
+        stdx::lock_guard lk(_mutex);
+        if (_taskState.isInterrupted()) {
+            uassertStatusOK(_taskState.getInterruptStatus());
+        }
+    }
 }
 
-void TenantMigrationRecipientService::Instance::_startOplogFetcher() {
+void TenantMigrationRecipientService::Instance::_createOplogBuffer() {
     auto opCtx = cc().makeOperationContext();
     OplogBufferCollection::Options options;
     options.peekCacheSize = static_cast<size_t>(tenantMigrationOplogBufferPeekCacheSize);
     options.dropCollectionAtStartup = false;
     options.dropCollectionAtShutdown = false;
     options.useTemporaryCollection = false;
+
+    auto oplogBufferNS = getOplogBufferNs(getMigrationUUID());
+    if (!_donorOplogBuffer) {
+        // Create the oplog buffer outside the mutex to avoid deadlock on a concurrent stepdown.
+        auto bufferCollection = std::make_unique<OplogBufferCollection>(
+            StorageInterface::get(opCtx.get()), oplogBufferNS, options);
+        stdx::lock_guard lk(_mutex);
+        _donorOplogBuffer = std::move(bufferCollection);
+    }
+
     stdx::unique_lock lk(_mutex);
     invariant(_stateDoc.getStartFetchingDonorOpTime());
-    _donorOplogBuffer = std::make_unique<OplogBufferCollection>(
-        StorageInterface::get(opCtx.get()), getOplogBufferNs(getMigrationUUID()), options);
-    _donorOplogBuffer->startup(opCtx.get());
+    {
+        // Ensure we are primary when trying to startup and create the oplog buffer collection.
+        auto coordinator = repl::ReplicationCoordinator::get(opCtx.get());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_IX);
+        if (!coordinator->canAcceptWritesForDatabase(opCtx.get(), oplogBufferNS.db())) {
+            uassertStatusOK(
+                Status(ErrorCodes::NotWritablePrimary,
+                       "Recipient node is not primary, cannot create oplog buffer collection."));
+        }
+        _donorOplogBuffer->startup(opCtx.get());
+    }
 
     pauseAfterCreatingOplogBuffer.pauseWhileSet();
+}
+
+void TenantMigrationRecipientService::Instance::_fetchRetryableWritesOplogBeforeStartOpTime() {
+    if (MONGO_unlikely(
+            skipFetchingRetryableWritesEntriesBeforeStartOpTime.shouldFail())) {  // Test-only.
+        return;
+    }
+
+    auto opCtx = cc().makeOperationContext();
+    auto expCtx = makeExpressionContext(opCtx.get());
+
+    Timestamp startFetchingTimestamp;
+    {
+        stdx::lock_guard lk(_mutex);
+        invariant(_stateDoc.getStartFetchingDonorOpTime());
+        startFetchingTimestamp = _stateDoc.getStartFetchingDonorOpTime().get().getTimestamp();
+    }
+
+    // Fetch the oplog chains of all retryable writes that occurred before startFetchingTimestamp
+    // on this tenant.
+    auto serializedPipeline =
+        tenant_migration_util::createRetryableWritesOplogFetchingPipelineForTenantMigrations(
+            expCtx, startFetchingTimestamp, getTenantId())
+            ->serializeToBson();
+
+    AggregateCommand aggRequest(NamespaceString::kSessionTransactionsTableNamespace,
+                                std::move(serializedPipeline));
+
+    auto readConcernArgs = repl::ReadConcernArgs(
+        boost::optional<repl::ReadConcernLevel>(repl::ReadConcernLevel::kMajorityReadConcern));
+    aggRequest.setReadConcern(readConcernArgs.toBSONInner());
+    // We must set a writeConcern on internal commands.
+    aggRequest.setWriteConcern(WriteConcernOptions());
+
+    std::unique_ptr<DBClientCursor> cursor = uassertStatusOK(DBClientCursor::fromAggregationRequest(
+        _client.get(), std::move(aggRequest), true /* secondaryOk */, false /* useExhaust */));
+
+    // Similar to the OplogFetcher, we keep track of each oplog entry to apply and the number of
+    // the bytes of the documents read off the network.
+    while (cursor->more()) {
+        // cursor->more() will automatically request more from the server if necessary.
+        std::vector<BSONObj> retryableWritesEntries;
+        retryableWritesEntries.reserve(cursor->objsLeftInBatch());
+        auto toApplyDocumentBytes = 0;
+
+        while (cursor->moreInCurrentBatch()) {
+            // Gather entries from current batch.
+            BSONObj doc = cursor->next();
+            toApplyDocumentBytes += doc.objsize();
+            retryableWritesEntries.push_back(doc);
+        }
+
+        if (retryableWritesEntries.size() != 0) {
+            // Wait for enough space.
+            _donorOplogBuffer->waitForSpace(opCtx.get(), toApplyDocumentBytes);
+            // Buffer retryable writes entries.
+            _donorOplogBuffer->push(
+                opCtx.get(), retryableWritesEntries.begin(), retryableWritesEntries.end());
+        }
+    }
+}
+
+void TenantMigrationRecipientService::Instance::_startOplogFetcher() {
+    auto opCtx = cc().makeOperationContext();
+    stdx::unique_lock lk(_mutex);
 
     _dataReplicatorExternalState = std::make_unique<DataReplicatorExternalStateTenantMigration>();
     auto startFetchOpTime = *_stateDoc.getStartFetchingDonorOpTime();
@@ -876,9 +1183,11 @@ void TenantMigrationRecipientService::Instance::_oplogFetcherCallback(Status opl
                     "error"_attr = oplogFetcherStatus);
         _interrupt(oplogFetcherStatus, /*skipWaitingForForgetMigration=*/false);
     }
+    _oplogFetcherStatus = oplogFetcherStatus;
 }
 
-void TenantMigrationRecipientService::Instance::_stopOrHangOnFailPoint(FailPoint* fp) {
+void TenantMigrationRecipientService::Instance::_stopOrHangOnFailPoint(FailPoint* fp,
+                                                                       OperationContext* opCtx) {
     fp->executeIf(
         [&](const BSONObj& data) {
             LOGV2(4881103,
@@ -888,7 +1197,11 @@ void TenantMigrationRecipientService::Instance::_stopOrHangOnFailPoint(FailPoint
                   "name"_attr = fp->getName(),
                   "args"_attr = data);
             if (data["action"].str() == "hang") {
-                fp->pauseWhileSet();
+                if (opCtx) {
+                    fp->pauseWhileSet(opCtx);
+                } else {
+                    fp->pauseWhileSet();
+                }
             } else {
                 uasserted(data["stopErrorCode"].numberInt(),
                           "Skipping remaining processing due to fail point");
@@ -927,8 +1240,9 @@ OpTime TenantMigrationRecipientService::Instance::_getOplogResumeApplyingDonorOp
              getMigrationUUID());
         // Find the most recent no-op oplog entry from the current migration.
         if (isFromCurrentMigration &&
-            (oplogObj.getStringField("op") == OpType_serializer(repl::OpTypeEnum::kNoop))) {
-            const auto migratedEntryObj = oplogObj.getObjectField("o");
+            (oplogObj.getStringField("op") == OpType_serializer(repl::OpTypeEnum::kNoop)) &&
+            oplogObj.hasField("o2")) {
+            const auto migratedEntryObj = oplogObj.getObjectField("o2");
             const auto swDonorOpTime = repl::OpTime::parseFromOplogEntry(migratedEntryObj);
             uassert(5272305,
                     str::stream() << "Unable to parse opTime from tenant migration oplog entry: "
@@ -1009,6 +1323,8 @@ SemiFuture<void> TenantMigrationRecipientService::Instance::_onCloneSuccess() {
     return ExecutorFuture(**_scopedExecutor)
         .then([this, self = shared_from_this(), stateDoc = _stateDoc] {
             auto opCtx = cc().makeOperationContext();
+
+            _stopOrHangOnFailPoint(&fpBeforeMarkingCollectionClonerDone, opCtx.get());
             uassertStatusOK(
                 tenantMigrationRecipientEntryHelpers::updateStateDoc(opCtx.get(), stateDoc));
 
@@ -1200,7 +1516,8 @@ void TenantMigrationRecipientService::Instance::_interrupt(Status status,
         }
     }
 
-    _taskState.setState(TaskState::kInterrupted, status);
+    _taskState.setState(
+        TaskState::kInterrupted, status, skipWaitingForForgetMigration /* isExternalInterrupt */);
 }
 
 void TenantMigrationRecipientService::Instance::interrupt(Status status) {
@@ -1302,18 +1619,16 @@ SemiFuture<void> TenantMigrationRecipientService::Instance::_updateStateDocForMa
 void TenantMigrationRecipientService::Instance::_fetchAndStoreDonorClusterTimeKeyDocs(
     const CancelationToken& token) {
     std::vector<ExternalKeysCollectionDocument> keyDocs;
-
     auto cursor =
         _client->query(NamespaceString::kKeysCollectionNamespace,
                        Query().readPref(_readPreference.pref, _readPreference.tags.getTagBSON()));
     while (cursor->more()) {
         const auto doc = cursor->nextSafe().getOwned();
-        keyDocs.push_back(tenant_migration_util::makeExternalClusterTimeKeyDoc(
-            _serviceContext, _migrationUuid, doc));
+        keyDocs.push_back(
+            tenant_migration_util::makeExternalClusterTimeKeyDoc(_migrationUuid, doc));
     }
 
-    tenant_migration_util::storeExternalClusterTimeKeyDocsAndRefreshCache(_scopedExecutor,
-                                                                          std::move(keyDocs));
+    tenant_migration_util::storeExternalClusterTimeKeyDocs(_scopedExecutor, std::move(keyDocs));
 }
 
 void TenantMigrationRecipientService::Instance::_compareRecipientAndDonorFCV() const {
@@ -1362,179 +1677,305 @@ SemiFuture<void> TenantMigrationRecipientService::Instance::run(
           "readPreference"_attr = _readPreference);
 
     pauseBeforeRunTenantMigrationRecipientInstance.pauseWhileSet();
+    // The 'AsyncTry' is run on the cleanup executor as opposed to the scoped executor  as we rely
+    // on the 'PrimaryService' to interrupt the operation contexts based on thread pool and not the
+    // executor.
+    return AsyncTry([this, self = shared_from_this(), executor, token] {
+               return ExecutorFuture(**executor)
+                   .then([this, self = shared_from_this()] {
+                       auto mtab = tenant_migration_access_blocker::
+                           getTenantMigrationRecipientAccessBlocker(_serviceContext,
+                                                                    _stateDoc.getTenantId());
+                       if (mtab && mtab->getMigrationId() != _migrationUuid) {
+                           // There is a conflicting migration. If its state doc has already been
+                           // marked as garbage collectable, this instance must correspond to a
+                           // retry and we can delete immediately to allow the migration to restart.
+                           // Otherwise, there is a real conflict so we should throw
+                           // ConflictingInProgress.
+                           auto opCtx = cc().makeOperationContext();
+                           auto deleted =
+                               uassertStatusOK(tenantMigrationRecipientEntryHelpers::
+                                                   deleteStateDocIfMarkedAsGarbageCollectable(
+                                                       opCtx.get(), _tenantId));
+                           uassert(ErrorCodes::ConflictingOperationInProgress,
+                                   str::stream()
+                                       << "Found active migration for tenantId \"" << _tenantId
+                                       << "\" with migration id " << mtab->getMigrationId(),
+                                   deleted);
+                       }
+                   })
+                   .then([this, self = shared_from_this()] {
+                       stdx::unique_lock lk(_mutex);
+                       // Instance task can be started only once for the current term on a primary.
+                       invariant(!_taskState.isDone());
+                       // If the task state is interrupted, then don't start the task.
+                       if (_taskState.isInterrupted()) {
+                           uassertStatusOK(_taskState.getInterruptStatus());
+                       }
 
-    return ExecutorFuture(**executor)
-        .then([this, self = shared_from_this()] {
-            stdx::lock_guard lk(_mutex);
-            // Instance task can be started only once for the current term on a primary.
-            invariant(!_taskState.isDone());
-            // If the task state is interrupted, then don't start the task.
-            if (_taskState.isInterrupted()) {
-                uassertStatusOK(_taskState.getInterruptStatus());
-            }
+                       // The task state will already have been set to 'kRunning' if we restarted
+                       // the future chain on donor failover.
+                       if (!_taskState.isRunning()) {
+                           _taskState.setState(TaskState::kRunning);
+                       }
+                       pauseAfterRunTenantMigrationRecipientInstance.pauseWhileSet();
 
-            _taskState.setState(TaskState::kRunning);
+                       if (_stateDoc.getState() !=
+                               TenantMigrationRecipientStateEnum::kUninitialized &&
+                           !_stateDocPersistedPromise.getFuture().isReady() &&
+                           !_stateDoc.getExpireAt()) {
+                           // If our state is initialized and we haven't fulfilled the
+                           // '_stateDocPersistedPromise' yet, it means we are restarting the future
+                           // chain due to recipient failover.
+                           auto opCtx = cc().makeOperationContext();
+                           _stateDoc.setNumRestartsDueToRecipientFailure(
+                               _stateDoc.getNumRestartsDueToRecipientFailure() + 1);
+                           const auto stateDoc = _stateDoc;
+                           lk.unlock();
+                           // Update the state document outside the mutex to avoid a deadlock in the
+                           // case of a concurrent stepdown.
+                           uassertStatusOK(tenantMigrationRecipientEntryHelpers::updateStateDoc(
+                               opCtx.get(), stateDoc));
+                           return SemiFuture<void>::makeReady();
+                       }
+                       return _initializeStateDoc(lk);
+                   })
+                   .then([this, self = shared_from_this()] {
+                       if (_stateDocPersistedPromise.getFuture().isReady()) {
+                           // This is a retry of the future chain due to donor failure.
+                           auto opCtx = cc().makeOperationContext();
+                           TenantMigrationRecipientDocument stateDoc;
+                           {
+                               stdx::lock_guard lk(_mutex);
+                               _stateDoc.setNumRestartsDueToDonorConnectionFailure(
+                                   _stateDoc.getNumRestartsDueToDonorConnectionFailure() + 1);
+                               stateDoc = _stateDoc;
+                           }
+                           uassertStatusOK(tenantMigrationRecipientEntryHelpers::updateStateDoc(
+                               opCtx.get(), _stateDoc));
+                       } else {
+                           // Avoid fulfilling the promise twice on restart of the future chain.
+                           _stateDocPersistedPromise.emplaceValue();
+                       }
+                       uassert(ErrorCodes::TenantMigrationForgotten,
+                               str::stream() << "Migration " << getMigrationUUID()
+                                             << " already marked for garbage collect",
+                               !_stateDoc.getExpireAt());
+                       _stopOrHangOnFailPoint(
+                           &fpAfterPersistingTenantMigrationRecipientInstanceStateDoc);
+                       return _createAndConnectClients();
+                   })
+                   .then([this, self = shared_from_this()](ConnectionPair ConnectionPair) {
+                       stdx::lock_guard lk(_mutex);
+                       if (_taskState.isInterrupted()) {
+                           uassertStatusOK(_taskState.getInterruptStatus());
+                       }
 
-            pauseAfterRunTenantMigrationRecipientInstance.pauseWhileSet();
+                       // interrupt() called after this code block will interrupt the cloner and
+                       // fetcher.
+                       _client = std::move(ConnectionPair.first);
+                       _oplogFetcherClient = std::move(ConnectionPair.second);
 
-            uassert(ErrorCodes::TenantMigrationForgotten,
-                    str::stream() << "Migration " << getMigrationUUID()
-                                  << " already marked for garbage collect",
-                    !_stateDoc.getExpireAt());
+                       if (!_writerPool) {
+                           // Create the writer pool and shared data.
+                           _writerPool = makeTenantMigrationWriterPool();
+                       }
+                       _sharedData = std::make_unique<TenantMigrationSharedData>(
+                           getGlobalServiceContext()->getFastClockSource(),
+                           getMigrationUUID(),
+                           _stateDoc.getStartFetchingDonorOpTime().has_value());
+                   })
+                   .then([this, self = shared_from_this(), token] {
+                       _fetchAndStoreDonorClusterTimeKeyDocs(token);
+                   })
+                   .then([this, self = shared_from_this()] {
+                       _stopOrHangOnFailPoint(&fpAfterConnectingTenantMigrationRecipientInstance);
+                       stdx::lock_guard lk(_mutex);
 
-            return _initializeStateDoc(lk);
-        })
-        .then([this, self = shared_from_this()] {
-            _stateDocPersistedPromise.emplaceValue();
-            _stopOrHangOnFailPoint(&fpAfterPersistingTenantMigrationRecipientInstanceStateDoc);
-            return _createAndConnectClients();
-        })
-        .then([this, self = shared_from_this()](ConnectionPair ConnectionPair) {
-            stdx::lock_guard lk(_mutex);
-            if (_taskState.isInterrupted()) {
-                uassertStatusOK(_taskState.getInterruptStatus());
-            }
+                       // Record the FCV at the start of a migration and check for changes in every
+                       // subsequent attempt. Fail if there is any mismatch in FCV or
+                       // upgrade/downgrade state. (Generic FCV reference): This FCV check should
+                       // exist across LTS binary versions.
+                       auto currentFCV = serverGlobalParams.featureCompatibility.getVersion();
+                       auto startingFCV = _stateDoc.getRecipientPrimaryStartingFCV();
 
-            // interrupt() called after this code block will interrupt the cloner and fetcher.
-            _client = std::move(ConnectionPair.first);
-            _oplogFetcherClient = std::move(ConnectionPair.second);
+                       if (!startingFCV) {
+                           _stateDoc.setRecipientPrimaryStartingFCV(currentFCV);
+                           return _updateStateDocForMajority(lk);
+                       }
 
-            // Create the writer pool and shared data.
-            _writerPool = makeTenantMigrationWriterPool();
-            _sharedData = std::make_unique<TenantMigrationSharedData>(
-                getGlobalServiceContext()->getFastClockSource(),
-                getMigrationUUID(),
-                _stateDoc.getStartFetchingDonorOpTime().has_value());
-        })
-        .then([this, self = shared_from_this(), token] {
-            _fetchAndStoreDonorClusterTimeKeyDocs(token);
-        })
-        .then([this, self = shared_from_this()] {
-            _stopOrHangOnFailPoint(&fpAfterConnectingTenantMigrationRecipientInstance);
-            stdx::lock_guard lk(_mutex);
+                       if (startingFCV != currentFCV) {
+                           LOGV2_ERROR(5356200,
+                                       "FCV may not change during migration",
+                                       "tenantId"_attr = getTenantId(),
+                                       "migrationId"_attr = getMigrationUUID(),
+                                       "startingFCV"_attr = startingFCV,
+                                       "currentFCV"_attr = currentFCV);
+                           uasserted(5356201, "Detected FCV change from last migration attempt.");
+                       }
 
-            // Record the FCV at the start of a migration and check for changes in every subsequent
-            // attempt. Fail if there is any mismatch in FCV or upgrade/downgrade state.
-            // (Generic FCV reference): This FCV check should exist across LTS binary versions.
-            auto currentFCV = serverGlobalParams.featureCompatibility.getVersion();
-            auto startingFCV = _stateDoc.getRecipientPrimaryStartingFCV();
+                       return SemiFuture<void>::makeReady();
+                   })
+                   .then([this, self = shared_from_this()] {
+                       _stopOrHangOnFailPoint(&fpAfterRecordingRecipientPrimaryStartingFCV);
+                       _compareRecipientAndDonorFCV();
+                   })
+                   .then([this, self = shared_from_this()] {
+                       _stopOrHangOnFailPoint(&fpAfterComparingRecipientAndDonorFCV);
+                       stdx::lock_guard lk(_mutex);
+                       _getStartOpTimesFromDonor(lk);
+                       return _updateStateDocForMajority(lk);
+                   })
+                   .then([this, self = shared_from_this()] {
+                       _stopOrHangOnFailPoint(
+                           &fpAfterRetrievingStartOpTimesMigrationRecipientInstance);
+                       _createOplogBuffer();
+                       _fetchRetryableWritesOplogBeforeStartOpTime();
+                   })
+                   .then([this, self = shared_from_this()] {
+                       _stopOrHangOnFailPoint(
+                           &fpAfterFetchingRetryableWritesEntriesBeforeStartOpTime);
+                       _startOplogFetcher();
+                   })
+                   .then([this, self = shared_from_this()] {
+                       _stopOrHangOnFailPoint(
+                           &fpAfterStartingOplogFetcherMigrationRecipientInstance);
 
-            if (!startingFCV) {
-                _stateDoc.setRecipientPrimaryStartingFCV(currentFCV);
-                return _updateStateDocForMajority(lk);
-            }
+                       stdx::unique_lock lk(_mutex);
 
-            if (startingFCV != currentFCV) {
-                LOGV2_ERROR(5356200,
-                            "FCV may not change during migration",
-                            "tenantId"_attr = getTenantId(),
-                            "migrationId"_attr = getMigrationUUID(),
-                            "startingFCV"_attr = startingFCV,
-                            "currentFCV"_attr = currentFCV);
-                uasserted(5356201, "Detected FCV change from last migration attempt.");
-            }
+                       {
+                           // Throwing error when cloner is canceled externally via interrupt(),
+                           // makes the instance to skip the remaining task (i.e., starting oplog
+                           // applier) in the sync process. This step is necessary to prevent race
+                           // between interrupt() and starting oplog applier for the failover
+                           // scenarios where we don't start the cloner if the tenant data is
+                           // already in consistent state.
+                           stdx::lock_guard<TenantMigrationSharedData> sharedDatalk(*_sharedData);
+                           uassertStatusOK(_sharedData->getStatus(sharedDatalk));
+                       }
 
-            return SemiFuture<void>::makeReady();
-        })
-        .then([this, self = shared_from_this()] {
-            _stopOrHangOnFailPoint(&fpAfterRecordingRecipientPrimaryStartingFCV);
-            _compareRecipientAndDonorFCV();
-        })
-        .then([this, self = shared_from_this()] {
-            _stopOrHangOnFailPoint(&fpAfterComparingRecipientAndDonorFCV);
-            stdx::lock_guard lk(_mutex);
-            _getStartOpTimesFromDonor(lk);
-            return _updateStateDocForMajority(lk);
-        })
-        .then([this, self = shared_from_this()] { _fetchRetryableWritesOplogBeforeStartOpTime(); })
-        .then([this, self = shared_from_this()] {
-            _stopOrHangOnFailPoint(&fpAfterRetrievingStartOpTimesMigrationRecipientInstance);
-            _startOplogFetcher();
-        })
-        .then([this, self = shared_from_this()] {
-            _stopOrHangOnFailPoint(&fpAfterStartingOplogFetcherMigrationRecipientInstance);
+                       // Create the oplog applier but do not start it yet.
+                       invariant(_stateDoc.getStartApplyingDonorOpTime());
 
+                       OpTime beginApplyingAfterOpTime;
+                       bool isResuming = false;
+                       if (_isCloneCompletedMarkerSet(lk)) {
+                           const auto startApplyingDonorOpTime =
+                               *_stateDoc.getStartApplyingDonorOpTime();
+                           const auto cloneFinishedRecipientOptime =
+                               *_stateDoc.getCloneFinishedRecipientOpTime();
+                           lk.unlock();
+                           // We avoid holding the mutex while scanning the local oplog which
+                           // acquires the RSTL in IX mode. This is to allow us to be interruptable
+                           // via a concurrent stepDown which acquires the RSTL in X mode.
+                           beginApplyingAfterOpTime = _getOplogResumeApplyingDonorOptime(
+                               startApplyingDonorOpTime, cloneFinishedRecipientOptime);
+                           isResuming = beginApplyingAfterOpTime > startApplyingDonorOpTime;
+                           lk.lock();
+                       } else {
+                           beginApplyingAfterOpTime = *_stateDoc.getStartApplyingDonorOpTime();
+                       }
+                       LOGV2_DEBUG(4881202,
+                                   1,
+                                   "Recipient migration service creating oplog applier",
+                                   "tenantId"_attr = getTenantId(),
+                                   "migrationId"_attr = getMigrationUUID(),
+                                   "startApplyingDonorOpTime"_attr = beginApplyingAfterOpTime);
+                       _tenantOplogApplier =
+                           std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                                                _tenantId,
+                                                                beginApplyingAfterOpTime,
+                                                                _donorOplogBuffer.get(),
+                                                                **_scopedExecutor,
+                                                                _writerPool.get(),
+                                                                isResuming);
+
+                       // Start the cloner.
+                       auto clonerFuture = _startTenantAllDatabaseCloner(lk);
+
+                       // Signal that the data sync has started successfully.
+                       if (!_dataSyncStartedPromise.getFuture().isReady()) {
+                           _dataSyncStartedPromise.emplaceValue();
+                       }
+                       return clonerFuture;
+                   })
+                   .then([this, self = shared_from_this()] { return _onCloneSuccess(); })
+                   .then([this, self = shared_from_this()] {
+                       _fetchCommittedTransactionsBeforeStartOpTime();
+                   })
+                   .then([this, self = shared_from_this()] {
+                       {
+                           auto opCtx = cc().makeOperationContext();
+                           _stopOrHangOnFailPoint(&fpAfterCollectionClonerDone, opCtx.get());
+                       }
+
+                       LOGV2_DEBUG(4881200,
+                                   1,
+                                   "Recipient migration service starting oplog applier",
+                                   "tenantId"_attr = getTenantId(),
+                                   "migrationId"_attr = getMigrationUUID());
+                       {
+                           stdx::lock_guard lk(_mutex);
+                           uassertStatusOK(_tenantOplogApplier->startup());
+                       }
+                       _stopOrHangOnFailPoint(
+                           &fpAfterStartingOplogApplierMigrationRecipientInstance);
+                       return _getDataConsistentFuture();
+                   })
+                   .then([this, self = shared_from_this()] {
+                       _stopOrHangOnFailPoint(&fpBeforeFulfillingDataConsistentPromise);
+                       stdx::lock_guard lk(_mutex);
+                       LOGV2_DEBUG(4881101,
+                                   1,
+                                   "Tenant migration recipient instance is in consistent state",
+                                   "migrationId"_attr = getMigrationUUID(),
+                                   "tenantId"_attr = getTenantId(),
+                                   "donorConsistentOpTime"_attr =
+                                       _stateDoc.getDataConsistentStopDonorOpTime());
+
+                       if (!_dataConsistentPromise.getFuture().isReady()) {
+                           _dataConsistentPromise.emplaceValue(
+                               _stateDoc.getDataConsistentStopDonorOpTime().get());
+                       }
+                   });
+           })
+        .until([this, self = shared_from_this()](Status status) {
             stdx::unique_lock lk(_mutex);
-
-            {
-                // Throwing error when cloner is canceled externally via interrupt(), makes the
-                // instance to skip the remaining task (i.e., starting oplog applier) in the
-                // sync process. This step is necessary to prevent race between interrupt()
-                // and starting oplog applier for the failover scenarios where we don't start
-                // the cloner if the tenant data is already in consistent state.
-                stdx::lock_guard<TenantMigrationSharedData> sharedDatalk(*_sharedData);
-                uassertStatusOK(_sharedData->getStatus(sharedDatalk));
+            if (_taskState.isInterrupted()) {
+                status = _taskState.getInterruptStatus();
             }
+            if (ErrorCodes::isRetriableError(status) && !_taskState.isExternalInterrupt() &&
+                _stateDocPersistedPromise.getFuture().isReady()) {
+                // Reset the task state and clear the interrupt status.
+                if (!_taskState.isRunning()) {
+                    _taskState.setState(TaskState::kRunning);
+                }
+                _taskState.clearInterruptStatus();
+                // Clean up the async components before retrying the future chain.
+                _oplogFetcherStatus = boost::none;
+                std::unique_ptr<OplogFetcher> savedDonorOplogFetcher;
+                std::shared_ptr<TenantOplogApplier> savedTenantOplogApplier;
 
-            // Create the oplog applier but do not start it yet.
-            invariant(_stateDoc.getStartApplyingDonorOpTime());
+                _cancelRemainingWork(lk);
+                shutdownTarget(lk, _donorOplogFetcher);
 
-            OpTime beginApplyingAfterOpTime;
-            bool isResuming = false;
-            if (_isCloneCompletedMarkerSet(lk)) {
-                const auto startApplyingDonorOpTime = *_stateDoc.getStartApplyingDonorOpTime();
-                const auto cloneFinishedRecipientOptime =
-                    *_stateDoc.getCloneFinishedRecipientOpTime();
+                // Swap the oplog fetcher and applier to join() outside of '_mutex'.
+                using std::swap;
+                swap(savedDonorOplogFetcher, _donorOplogFetcher);
+                swap(savedTenantOplogApplier, _tenantOplogApplier);
                 lk.unlock();
-                // We avoid holding the mutex while scanning the local oplog which acquires the RSTL
-                // in IX mode. This is to allow us to be interruptable via a concurrent stepDown
-                // which acquires the RSTL in X mode.
-                beginApplyingAfterOpTime = _getOplogResumeApplyingDonorOptime(
-                    startApplyingDonorOpTime, cloneFinishedRecipientOptime);
-                isResuming = beginApplyingAfterOpTime > startApplyingDonorOpTime;
-                lk.lock();
-            } else {
-                beginApplyingAfterOpTime = *_stateDoc.getStartApplyingDonorOpTime();
+
+                // Perform join outside the lock to avoid deadlocks.
+                joinTarget(savedDonorOplogFetcher);
+                joinTarget(savedTenantOplogApplier);
+                return false;
             }
-            LOGV2_DEBUG(4881202,
-                        1,
-                        "Recipient migration service creating oplog applier",
-                        "tenantId"_attr = getTenantId(),
-                        "migrationId"_attr = getMigrationUUID(),
-                        "startApplyingDonorOpTime"_attr = beginApplyingAfterOpTime);
-            _tenantOplogApplier = std::make_shared<TenantOplogApplier>(_migrationUuid,
-                                                                       _tenantId,
-                                                                       beginApplyingAfterOpTime,
-                                                                       _donorOplogBuffer.get(),
-                                                                       **_scopedExecutor,
-                                                                       _writerPool.get(),
-                                                                       isResuming);
-
-            // Start the cloner.
-            auto clonerFuture = _startTenantAllDatabaseCloner(lk);
-
-            // Signal that the data sync has started successfully.
-            _dataSyncStartedPromise.emplaceValue();
-            return clonerFuture;
+            return true;
         })
-        .then([this, self = shared_from_this()] { return _onCloneSuccess(); })
-        .then([this, self = shared_from_this()] { _fetchCommittedTransactionsBeforeStartOpTime(); })
-        .then([this, self = shared_from_this()] {
-            _stopOrHangOnFailPoint(&fpAfterCollectionClonerDone);
-            LOGV2_DEBUG(4881200,
-                        1,
-                        "Recipient migration service starting oplog applier",
-                        "tenantId"_attr = getTenantId(),
-                        "migrationId"_attr = getMigrationUUID());
-            {
-                stdx::lock_guard lk(_mutex);
-                uassertStatusOK(_tenantOplogApplier->startup());
-            }
-            _stopOrHangOnFailPoint(&fpAfterStartingOplogApplierMigrationRecipientInstance);
-            return _getDataConsistentFuture();
-        })
-        .then([this, self = shared_from_this()] {
-            stdx::lock_guard lk(_mutex);
-            LOGV2_DEBUG(4881101,
-                        1,
-                        "Tenant migration recipient instance is in consistent state",
-                        "migrationId"_attr = getMigrationUUID(),
-                        "tenantId"_attr = getTenantId(),
-                        "donorConsistentOpTime"_attr =
-                            _stateDoc.getDataConsistentStopDonorOpTime());
-
-            _dataConsistentPromise.emplaceValue(_stateDoc.getDataConsistentStopDonorOpTime().get());
-        })
+        .withBackoffBetweenIterations(kExponentialBackoff)
+        .on(_recipientService->getInstanceCleanupExecutor(), token)
+        .semi()
+        .thenRunOn(**_scopedExecutor)
         .then([this, self = shared_from_this()] {
             _stopOrHangOnFailPoint(&fpAfterDataConsistentMigrationRecipientInstance);
             stdx::lock_guard lk(_mutex);
@@ -1546,23 +1987,29 @@ SemiFuture<void> TenantMigrationRecipientService::Instance::run(
         .thenRunOn(_recipientService->getInstanceCleanupExecutor())
         .onCompletion([this, self = shared_from_this()](
                           StatusOrStatusWith<TenantOplogApplier::OpTimePair> applierStatus) {
-            // On shutDown/stepDown, the _scopedExecutor may have already been shut down. So we need
-            // to schedule the clean up work on the parent executor.
+            // On shutDown/stepDown, the _scopedExecutor may have already been shut down. So we
+            // need to schedule the clean up work on the parent executor.
 
             // We don't need the final optime from the oplog applier. The data sync does not
             // normally stop by itself on success. It completes only on errors or on external
             // interruption (e.g. by shutDown/stepDown or by recipientForgetMigration command).
             Status status = applierStatus.getStatus();
-            {
-                // If we were interrupted during oplog application, replace oplog application
-                // status with error state.
+
+            // TODO (SERVER-54735): Remove this once AsyncTry can no longer set its result with
+            // BrokenPromise error.
+            if (status == ErrorCodes::BrokenPromise) {
+                status = Status{ErrorCodes::InterruptedDueToReplStateChange,
+                                "operation was interrupted"};
+            }
+
+            // If we were interrupted during oplog application, replace oplog application
+            // status with error state.
+            // Network and cancellation errors can be caused due to interrupt() (which shuts
+            // down the cloner/fetcher dbClientConnection & oplog applier), so replace those
+            // error status with interrupt status, if set.
+            if (ErrorCodes::isCancelationError(status) || ErrorCodes::isNetworkError(status)) {
                 stdx::lock_guard lk(_mutex);
-                // Network and cancellation errors can be caused due to interrupt() (which shuts
-                // down the cloner/fetcher dbClientConnection & oplog applier), so replace those
-                // error status with interrupt status, if set.
-                if ((ErrorCodes::isCancelationError(status) ||
-                     ErrorCodes::isNetworkError(status)) &&
-                    _taskState.isInterrupted()) {
+                if (_taskState.isInterrupted()) {
                     LOGV2(4881207,
                           "Migration completed with both error and interrupt",
                           "tenantId"_attr = getTenantId(),
@@ -1598,31 +2045,44 @@ SemiFuture<void> TenantMigrationRecipientService::Instance::run(
         })
         .thenRunOn(**_scopedExecutor)
         .then([this, self = shared_from_this()] {
-            // Schedule on the _scopedExecutor to make sure we are still the primary when waiting
-            // for the recipientForgetMigration command.
+            // Schedule on the _scopedExecutor to make sure we are still the primary when
+            // waiting for the recipientForgetMigration command.
             return _receivedRecipientForgetMigrationPromise.getFuture();
+        })
+        .then([this, self = shared_from_this(), token] {
+            // Note marking the keys as garbage collectable is not atomic with marking the
+            // state document garbage collectable, so an interleaved failover can lead the
+            // keys to be deleted before the state document has an expiration date. This is
+            // acceptable because the decision to forget a migration is not reversible.
+            return tenant_migration_util::markExternalKeysAsGarbageCollectable(
+                _serviceContext,
+                _scopedExecutor,
+                _recipientService->getInstanceCleanupExecutor(),
+                _migrationUuid,
+                token);
         })
         .then([this, self = shared_from_this()] { return _markStateDocAsGarbageCollectable(); })
         .then([this, self = shared_from_this()] {
+            _stopOrHangOnFailPoint(&fpBeforeDroppingOplogBufferCollection);
             auto opCtx = cc().makeOperationContext();
             auto storageInterface = StorageInterface::get(opCtx.get());
 
-            // The oplog buffer collection can be safely dropped at this point. In case it doesn't
-            // exist, dropping will be a no-op.
-            // It isn't necessary that the drop is majority-committed. A new primary will attempt
-            // to drop the collection anyway.
+            // The oplog buffer collection can be safely dropped at this point. In case it
+            // doesn't exist, dropping will be a no-op. It isn't necessary that the drop is
+            // majority-committed. A new primary will attempt to drop the collection anyway.
             return storageInterface->dropCollection(opCtx.get(),
                                                     getOplogBufferNs(getMigrationUUID()));
         })
         .thenRunOn(_recipientService->getInstanceCleanupExecutor())
         .onCompletion([this, self = shared_from_this()](Status status) {
-            // Schedule on the parent executor to mark the completion of the whole chain so this is
-            // safe even on shutDown/stepDown.
+            // Schedule on the parent executor to mark the completion of the whole chain so this
+            // is safe even on shutDown/stepDown.
             stdx::lock_guard lk(_mutex);
             invariant(_dataSyncCompletionPromise.getFuture().isReady());
             if (status.isOK()) {
                 LOGV2(4881401,
-                      "Migration marked to be garbage collectable due to recipientForgetMigration "
+                      "Migration marked to be garbage collectable due to "
+                      "recipientForgetMigration "
                       "command",
                       "migrationId"_attr = getMigrationUUID(),
                       "tenantId"_attr = getTenantId(),

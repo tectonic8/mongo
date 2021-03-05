@@ -43,7 +43,7 @@
 #include "mongo/client/authenticate.h"
 #include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/config.h"
-#include "mongo/db/audit.h"
+#include "mongo/db/auth/auth_options_gen.h"
 #include "mongo/db/auth/authentication_session.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
@@ -53,8 +53,8 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/authentication_commands_gen.h"
 #include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/commands/user_management_commands_gen.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/stats/counters.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/random.h"
 #include "mongo/rpc/metadata/client_metadata.h"
@@ -199,30 +199,33 @@ constexpr auto kX509AuthenticationDisabledMessage = "x.509 authentication is dis
  * mechanism, and ProtocolError, indicating an error in the use of the authentication
  * protocol.
  */
-void _authenticateX509(OperationContext* opCtx,
-                       AuthenticationSession* session,
-                       UserName& user,
-                       StringData dbname) {
-    if (user.getUser().empty()) {
-        auto& sslPeerInfo = SSLPeerInfo::forSession(opCtx->getClient()->session());
-        user = UserName(sslPeerInfo.subjectName.toString(), dbname);
-    }
+void _authenticateX509(OperationContext* opCtx, AuthenticationSession* session) {
+    auto client = opCtx->getClient();
+
+    auto& sslPeerInfo = SSLPeerInfo::forSession(client->session());
+    auto clientName = sslPeerInfo.subjectName;
+    uassert(ErrorCodes::AuthenticationFailed,
+            "No verified subject name available from client",
+            !clientName.empty());
+
+    auto user = [&] {
+        if (session->getUserName().empty()) {
+            auto user = UserName(clientName.toString(), session->getDatabase().toString());
+            session->updateUserName(user);
+            return user;
+        } else {
+            uassert(ErrorCodes::AuthenticationFailed,
+                    "There is no x.509 client certificate matching the user.",
+                    session->getUserName() == clientName.toString());
+            return UserName(session->getUserName().toString(), session->getDatabase().toString());
+        }
+    }();
 
     uassert(ErrorCodes::ProtocolError,
             "SSL support is required for the MONGODB-X509 mechanism.",
             opCtx->getClient()->session()->getSSLManager());
 
-    uassert(ErrorCodes::ProtocolError,
-            "X.509 authentication must always use the $external database.",
-            user.getDB() == "$external");
-
-    Client* client = Client::getCurrent();
     AuthorizationSession* authorizationSession = AuthorizationSession::get(client);
-    auto clientName = SSLPeerInfo::forSession(client->session()).subjectName;
-
-    uassert(ErrorCodes::AuthenticationFailed,
-            "No verified subject name available from client",
-            !clientName.empty());
 
     auto sslConfiguration = opCtx->getClient()->session()->getSSLConfiguration();
 
@@ -230,57 +233,59 @@ void _authenticateX509(OperationContext* opCtx,
             "Unable to verify x.509 certificate, as no CA has been provided.",
             sslConfiguration->hasCA);
 
-    uassert(ErrorCodes::AuthenticationFailed,
-            "There is no x.509 client certificate matching the user.",
-            user.getUser() == clientName.toString());
+    uassert(ErrorCodes::ProtocolError,
+            "X.509 authentication must always use the $external database.",
+            user.getDB() == kExternalDB);
 
-    // Handle internal cluster member auth, only applies to server-server connections
-    if (sslConfiguration->isClusterMember(clientName)) {
-        authCounter.getMechanismCounter("MONGODB-X509").incClusterAuthenticateReceived();
+    auto isInternalClient = [&]() -> bool {
+        return opCtx->getClient()->session()->getTags() & transport::Session::kInternalClient;
+    };
 
-        int clusterAuthMode = serverGlobalParams.clusterAuthMode.load();
-
-        uassert(ErrorCodes::AuthenticationFailed,
-                "The provided certificate "
-                "can only be used for cluster authentication, not client "
-                "authentication. The current configuration does not allow "
-                "x.509 cluster authentication, check the --clusterAuthMode flag",
-                clusterAuthMode != ServerGlobalParams::ClusterAuthMode_undefined &&
-                    clusterAuthMode != ServerGlobalParams::ClusterAuthMode_keyFile);
-
-        if (auto clientMetadata = ClientMetadata::get(opCtx->getClient())) {
-            auto clientMetadataDoc = clientMetadata->getDocument();
-            auto driverName = clientMetadataDoc.getObjectField("driver"_sd)
-                                  .getField("name"_sd)
-                                  .checkAndGetStringData();
-            if (!clientMetadata->getApplicationName().empty() ||
-                (driverName != "MongoDB Internal Client" && driverName != "NetworkInterfaceTL")) {
-                LOGV2_WARNING(20430,
-                              "Client isn't a mongod or mongos, but is connecting with a "
-                              "certificate with cluster membership");
-            }
-        }
-        authCounter.getMechanismCounter("MONGODB-X509").incClusterAuthenticateSuccessful();
-
-        authorizationSession->grantInternalAuthorization(client);
-    } else {
-        // Handle normal client authentication, only applies to client-server connections
+    auto authorizeExternalUser = [&] {
         uassert(ErrorCodes::BadValue,
                 kX509AuthenticationDisabledMessage,
                 !isX509AuthDisabled(opCtx->getServiceContext()));
         uassertStatusOK(authorizationSession->addAndAuthorizeUser(opCtx, user));
+    };
+
+    if (sslConfiguration->isClusterMember(clientName)) {
+        // Handle internal cluster member auth, only applies to server-server connections
+        switch (serverGlobalParams.clusterAuthMode.load()) {
+            case ServerGlobalParams::ClusterAuthMode_undefined:
+            case ServerGlobalParams::ClusterAuthMode_keyFile: {
+                uassert(ErrorCodes::AuthenticationFailed,
+                        "The provided certificate can only be used for cluster authentication, not "
+                        "client authentication. The current configuration does not allow x.509 "
+                        "cluster authentication, check the --clusterAuthMode flag",
+                        !gEnforceUserClusterSeparation);
+
+                authorizeExternalUser();
+            } break;
+            case ServerGlobalParams::ClusterAuthMode_sendKeyFile:
+            case ServerGlobalParams::ClusterAuthMode_sendX509:
+            case ServerGlobalParams::ClusterAuthMode_x509: {
+                if (!isInternalClient()) {
+                    LOGV2_WARNING(
+                        20430,
+                        "Client isn't a mongod or mongos, but is connecting with a certificate "
+                        "with cluster membership");
+                }
+
+                session->setAsClusterMember();
+                authorizationSession->grantInternalAuthorization(client);
+            } break;
+        };
+    } else {
+        // Handle normal client authentication, only applies to client-server connections
+        authorizeExternalUser();
     }
 }
 #endif  // MONGO_CONFIG_SSL
 
-void _authenticate(OperationContext* opCtx,
-                   AuthenticationSession* session,
-                   StringData mechanism,
-                   UserName& user,
-                   StringData dbname) {
+void _authenticate(OperationContext* opCtx, AuthenticationSession* session, StringData mechanism) {
 #ifdef MONGO_CONFIG_SSL
     if (mechanism == kX509AuthMechanism) {
-        return _authenticateX509(opCtx, session, user, dbname);
+        return _authenticateX509(opCtx, session);
     }
 #endif
     uasserted(ErrorCodes::BadValue, "Unsupported mechanism: " + mechanism);
@@ -289,63 +294,63 @@ void _authenticate(OperationContext* opCtx,
 AuthenticateReply authCommand(OperationContext* opCtx,
                               AuthenticationSession* session,
                               const AuthenticateCommand& cmd) {
+    auto client = opCtx->getClient();
+
     auto dbname = cmd.getDbName();
-    UserName user(cmd.getUser().value_or(""), dbname);
-    const std::string mechanism(cmd.getMechanism());
+    auto user = cmd.getUser().value_or("");
+
+    auto mechanism = cmd.getMechanism();
 
     if (!serverGlobalParams.quiet.load()) {
         LOGV2_DEBUG(5315501,
                     2,
                     "Authenticate Command",
-                    "db"_attr = dbname,
+                    "client"_attr = client->getRemote(),
+                    "mechanism"_attr = mechanism,
                     "user"_attr = user,
-                    "mechanism"_attr = mechanism);
+                    "db"_attr = dbname);
+    }
+
+    auto& internalSecurityUser = internalSecurity.user->getName();
+    if (getTestCommandsEnabled() && dbname == "admin" && user == internalSecurityUser.getUser()) {
+        // Allows authenticating as the internal user against the admin database.  This is to
+        // support the auth passthrough test framework on mongos (since you can't use the local
+        // database on a mongos, so you can't auth as the internal user without this).
+        session->updateUserName(internalSecurityUser);
+    } else {
+        session->updateUserName(UserName{user, dbname});
     }
 
     if (mechanism.empty()) {
         uasserted(ErrorCodes::BadValue, "Auth mechanism not specified");
     }
-
-    if (getTestCommandsEnabled() && user.getDB() == "admin" &&
-        user.getUser() == internalSecurity.user->getName().getUser()) {
-        // Allows authenticating as the internal user against the admin database.  This is to
-        // support the auth passthrough test framework on mongos (since you can't use the local
-        // database on a mongos, so you can't auth as the internal user without this).
-        user = internalSecurity.user->getName();
-    }
+    session->setMechanismName(mechanism);
 
     try {
-        auto mechCounter = authCounter.getMechanismCounter("MONGODB-X509");
-        mechCounter.incAuthenticateReceived();
-
-        _authenticate(opCtx, session, mechanism, user, dbname);
-        audit::logAuthentication(opCtx->getClient(), mechanism, user, ErrorCodes::OK);
-
+        _authenticate(opCtx, session, mechanism);
         if (!serverGlobalParams.quiet.load()) {
             LOGV2(20429,
-                  "Successfully authenticated as principal {user} on {db} from client {client}",
                   "Successfully authenticated",
-                  "user"_attr = user.getUser(),
-                  "db"_attr = user.getDB(),
-                  "remote"_attr = opCtx->getClient()->session()->remote());
+                  "client"_attr = client->getRemote(),
+                  "mechanism"_attr = mechanism,
+                  "user"_attr = session->getUserName(),
+                  "db"_attr = session->getDatabase());
         }
 
         session->markSuccessful();
-        mechCounter.incAuthenticateSuccessful();
 
-        return AuthenticateReply(user.getUser().toString(), user.getDB().toString());
+        return AuthenticateReply(session->getUserName().toString(),
+                                 session->getDatabase().toString());
 
     } catch (const AssertionException& ex) {
-        auto status = ex.toStatus();
-        auto const client = opCtx->getClient();
-        audit::logAuthentication(client, mechanism, user, status.code());
         if (!serverGlobalParams.quiet.load()) {
             LOGV2(20428,
                   "Failed to authenticate",
-                  "user"_attr = user,
                   "client"_attr = client->getRemote(),
                   "mechanism"_attr = mechanism,
-                  "error"_attr = status);
+                  "user"_attr = session->getUserName(),
+                  "db"_attr = session->getDatabase(),
+                  "error"_attr = ex.toStatus());
         }
 
         throw;
@@ -410,16 +415,7 @@ void doSpeculativeAuthenticate(OperationContext* opCtx,
 
     AuthenticationSession::doStep(
         opCtx, AuthenticationSession::StepType::kSpeculativeAuthenticate, [&](auto session) {
-            const auto mechanism = authCmdObj.getMechanism().toString();
-            try {
-                authCounter.getMechanismCounter(mechanism).incSpeculativeAuthenticateReceived();
-            } catch (...) {
-                // Run will make sure an audit entry happens. Let it reach that point.
-            }
-
             auto authReply = authCommand(opCtx, session, authCmdObj);
-
-            authCounter.getMechanismCounter(mechanism).incSpeculativeAuthenticateSuccessful();
             result->append(auth::kSpeculativeAuthenticate, authReply.toBSON());
         });
 } catch (...) {

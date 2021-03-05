@@ -222,6 +222,8 @@ TEST_F(CollectionTest, CreateTimeseriesBucketCollection) {
                                      << "_id_"
                                      << "key" << BSON("_id" << 1));
 
+    CollectionOptions options;
+    options.clusteredIndex = ClusteredIndexOptions{};
     {
         WriteUnitOfWork wuow(operationContext());
 
@@ -229,7 +231,7 @@ TEST_F(CollectionTest, CreateTimeseriesBucketCollection) {
         // the collection.
         Collection* collection = db->createCollection(operationContext(),
                                                       nss,
-                                                      CollectionOptions(),
+                                                      options,
                                                       /*createIdIndex=*/true,
                                                       /*idIndex=*/
                                                       idxSpec);
@@ -240,16 +242,17 @@ TEST_F(CollectionTest, CreateTimeseriesBucketCollection) {
             operationContext(), idxSpec);
         ASSERT_NOT_OK(swSpec.getStatus());
         ASSERT_EQ(swSpec.getStatus().code(), ErrorCodes::CannotCreateIndex);
-        ASSERT_STRING_CONTAINS(swSpec.getStatus().reason(),
-                               "cannot have an _id index on a time-series bucket collection");
+        ASSERT_STRING_CONTAINS(
+            swSpec.getStatus().reason(),
+            "cannot create an _id index on a collection already clustered by _id");
 
         // Rollback.
     }
 
     {
         WriteUnitOfWork wuow(operationContext());
-        auto collection = db->createCollection(
-            operationContext(), nss, CollectionOptions(), /*createIdIndex=*/false);
+        auto collection =
+            db->createCollection(operationContext(), nss, options, /*createIdIndex=*/false);
         ASSERT(collection);
         ASSERT_EQ(0, collection->getIndexCatalog()->numIndexesTotal(operationContext()));
         wuow.commit();

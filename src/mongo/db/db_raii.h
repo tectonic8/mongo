@@ -244,9 +244,12 @@ private:
         bool _isLockFreeReadSubOperation;
     };
 
+    // The CollectionCatalogStasher must outlive the LockFreeReadsBlock in the AutoGet* below.
+    // ~LockFreeReadsBlock clears a flag that the ~CollectionCatalogStasher checks.
+    CollectionCatalogStasher _catalogStash;
+
     boost::optional<AutoGetCollectionForReadBase<AutoGetCollectionLockFree, EmplaceHelper>>
         _autoGetCollectionForReadBase;
-    CollectionCatalogStasher _catalogStash;
 };
 
 /**
@@ -396,6 +399,25 @@ private:
 };
 
 /**
+ * Acquires the global MODE_IS lock and establishes a consistent CollectionCatalog and storage
+ * snapshot.
+ */
+class AutoReadLockFree {
+public:
+    AutoReadLockFree(OperationContext* opCtx, Date_t deadline = Date_t::max());
+
+private:
+    // The CollectionCatalogStasher must outlive the LockFreeReadsBlock below. ~LockFreeReadsBlock
+    // clears a flag that the ~CollectionCatalogStasher checks.
+    CollectionCatalogStasher _catalogStash;
+
+    // Sets a flag on the opCtx to inform subsequent code that the operation is running lock-free.
+    LockFreeReadsBlock _lockFreeReadsBlock;
+
+    Lock::GlobalLock _globalLock;
+};
+
+/**
  * Establishes a consistent CollectionCatalog with a storage snapshot. Also verifies Database
  * sharding state for the provided Db. Takes MODE_IS global lock.
  *
@@ -412,11 +434,14 @@ public:
                              Date_t deadline = Date_t::max());
 
 private:
+    // The CollectionCatalogStasher must outlive the LockFreeReadsBlock below. ~LockFreeReadsBlock
+    // clears a flag that the ~CollectionCatalogStasher checks.
+    CollectionCatalogStasher _catalogStash;
+
     // Sets a flag on the opCtx to inform subsequent code that the operation is running lock-free.
     LockFreeReadsBlock _lockFreeReadsBlock;
 
     Lock::GlobalLock _globalLock;
-    CollectionCatalogStasher _catalogStash;
 };
 
 /**

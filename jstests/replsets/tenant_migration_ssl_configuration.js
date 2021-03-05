@@ -18,9 +18,9 @@ const kReadPreference = {
 const kValidMigrationCertificates = TenantMigrationUtil.makeMigrationCertificatesForTest();
 const kExpiredMigrationCertificates = {
     donorCertificateForRecipient: TenantMigrationUtil.getCertificateAndPrivateKey(
-        "jstests/libs/rs0_tenant_migration_expired.pem"),
+        "jstests/libs/tenant_migration_donor_expired.pem"),
     recipientCertificateForDonor: TenantMigrationUtil.getCertificateAndPrivateKey(
-        "jstests/libs/rs1_tenant_migration_expired.pem")
+        "jstests/libs/tenant_migration_recipient_expired.pem")
 };
 
 (() => {
@@ -66,6 +66,7 @@ const kExpiredMigrationCertificates = {
         migrationId: UUID(),
         donorConnectionString: tenantMigrationTest.getDonorRst().getURL(),
         tenantId: kTenantId,
+        startMigrationDonorTimestamp: Timestamp(1, 1),
         readPreference: kReadPreference
     }),
                                  ErrorCodes.InvalidOptions);
@@ -137,6 +138,7 @@ const kExpiredMigrationCertificates = {
         donorConnectionString: tenantMigrationTest.getDonorRst().getURL(),
         tenantId: kTenantId,
         readPreference: kReadPreference,
+        startMigrationDonorTimestamp: Timestamp(1, 1),
         recipientCertificateForDonor: kValidMigrationCertificates.recipientCertificateForDonor,
     }),
                                  ErrorCodes.IllegalOperation);
@@ -176,7 +178,7 @@ const kExpiredMigrationCertificates = {
         donorRst,
         false /* retryOnRetryableErrors */,
         TenantMigrationUtil.isMigrationCompleted /* shouldStopFunc */));
-    assert.eq(stateRes.state, TenantMigrationTest.State.kAborted);
+    assert.eq(stateRes.state, TenantMigrationTest.DonorState.kAborted);
     // The command should fail with HostUnreachable since the donor was unable to establish an SSL
     // connection with the recipient.
     assert.eq(stateRes.abortReason.code, ErrorCodes.HostUnreachable);
@@ -213,6 +215,7 @@ const kExpiredMigrationCertificates = {
         migrationId: UUID(),
         donorConnectionString: tenantMigrationTest.getDonorRst().getURL(),
         tenantId: kTenantId,
+        startMigrationDonorTimestamp: Timestamp(1, 1),
         readPreference: kReadPreference
     }));
 
@@ -301,7 +304,7 @@ const kExpiredMigrationCertificates = {
         donorRst,
         false /* retryOnRetryableErrors */,
         TenantMigrationUtil.isMigrationCompleted /* shouldStopFunc */));
-    assert.eq(stateRes.state, TenantMigrationTest.State.kCommitted);
+    assert.eq(stateRes.state, TenantMigrationTest.DonorState.kCommitted);
     assert.commandWorked(
         donorRst.getPrimary().adminCommand({donorForgetMigration: 1, migrationId: migrationId}));
 })();
@@ -349,7 +352,7 @@ const kExpiredMigrationCertificates = {
         donorRst,
         false /* retryOnRetryableErrors */,
         TenantMigrationUtil.isMigrationCompleted /* shouldStopFunc */));
-    assert.eq(stateRes.state, TenantMigrationTest.State.kCommitted);
+    assert.eq(stateRes.state, TenantMigrationTest.DonorState.kCommitted);
 
     donorRst.stopSet();
     recipientRst.stopSet();
@@ -402,7 +405,7 @@ const kExpiredMigrationCertificates = {
         donorRst,
         false /* retryOnRetryableErrors */,
         TenantMigrationUtil.isMigrationCompleted /* shouldStopFunc */));
-    assert.eq(stateRes.state, TenantMigrationTest.State.kCommitted);
+    assert.eq(stateRes.state, TenantMigrationTest.DonorState.kCommitted);
 
     donorRst.stopSet();
     recipientRst.stopSet();

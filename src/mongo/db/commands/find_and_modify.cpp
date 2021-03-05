@@ -52,7 +52,6 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/delete_request_gen.h"
-#include "mongo/db/ops/find_and_modify_command_gen.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/ops/parsed_delete.h"
 #include "mongo/db/ops/parsed_update.h"
@@ -708,8 +707,10 @@ void CmdFindAndModify::Invocation::appendMirrorableRequest(BSONObjBuilder* bob) 
     const auto& req = request();
 
     bob->append(FindCommand::kCommandName, req.getNamespace().coll());
-    bob->append(FindCommand::kFilterFieldName, req.getQuery());
 
+    if (!req.getQuery().isEmpty()) {
+        bob->append(FindCommand::kFilterFieldName, req.getQuery());
+    }
     if (req.getSort()) {
         bob->append(write_ops::FindAndModifyCommand::kSortFieldName, *req.getSort());
     }

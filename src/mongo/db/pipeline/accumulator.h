@@ -224,6 +224,58 @@ private:
     Value _last;
 };
 
+class AccumulatorRankBase : public AccumulatorState {
+public:
+    explicit AccumulatorRankBase(ExpressionContext* const expCtx);
+    void reset();
+
+    bool isAssociative() const final {
+        tasserted(5417004,
+                  str::stream() << "Invalid call to isAssociative in accumulator " << getOpName());
+    }
+    bool isCommutative() const final {
+        tasserted(5417000,
+                  str::stream() << "Invalid call to isCommutative in accumulator " << getOpName());
+    }
+
+    Value getValue(bool toBeMerged) final {
+        return Value::createIntOrLong(_lastRank);
+    }
+
+protected:
+    long long _lastRank = 0;
+    boost::optional<Value> _lastInput = boost::none;
+};
+
+class AccumulatorRank : public AccumulatorRankBase {
+public:
+    explicit AccumulatorRank(ExpressionContext* const expCtx) : AccumulatorRankBase(expCtx) {}
+    void processInternal(const Value& input, bool merging) final;
+    const char* getOpName() const final;
+    static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* const expCtx);
+    void reset() final;
+
+private:
+    size_t _numSameRank = 1;
+};
+
+class AccumulatorDocumentNumber : public AccumulatorRankBase {
+public:
+    explicit AccumulatorDocumentNumber(ExpressionContext* const expCtx)
+        : AccumulatorRankBase(expCtx) {}
+    void processInternal(const Value& input, bool merging) final;
+    const char* getOpName() const final;
+    static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* const expCtx);
+};
+
+class AccumulatorDenseRank : public AccumulatorRankBase {
+public:
+    explicit AccumulatorDenseRank(ExpressionContext* const expCtx) : AccumulatorRankBase(expCtx) {}
+    void processInternal(const Value& input, bool merging) final;
+    const char* getOpName() const final;
+    static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* const expCtx);
+};
+
 class AccumulatorSum final : public AccumulatorState {
 public:
     explicit AccumulatorSum(ExpressionContext* const expCtx);
@@ -252,8 +304,8 @@ private:
 class AccumulatorMinMax : public AccumulatorState {
 public:
     enum Sense : int {
-        MIN = 1,
-        MAX = -1,  // Used to "scale" comparison.
+        kMin = 1,
+        kMax = -1,  // Used to "scale" comparison.
     };
 
     AccumulatorMinMax(ExpressionContext* const expCtx, Sense sense);
@@ -278,13 +330,15 @@ private:
 
 class AccumulatorMax final : public AccumulatorMinMax {
 public:
-    explicit AccumulatorMax(ExpressionContext* const expCtx) : AccumulatorMinMax(expCtx, MAX) {}
+    explicit AccumulatorMax(ExpressionContext* const expCtx)
+        : AccumulatorMinMax(expCtx, Sense::kMax) {}
     static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* const expCtx);
 };
 
 class AccumulatorMin final : public AccumulatorMinMax {
 public:
-    explicit AccumulatorMin(ExpressionContext* const expCtx) : AccumulatorMinMax(expCtx, MIN) {}
+    explicit AccumulatorMin(ExpressionContext* const expCtx)
+        : AccumulatorMinMax(expCtx, Sense::kMin) {}
     static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* const expCtx);
 };
 

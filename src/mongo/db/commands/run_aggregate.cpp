@@ -516,6 +516,21 @@ std::vector<std::unique_ptr<Pipeline, PipelineDeleter>> createExchangePipelinesI
 
     return pipelines;
 }
+
+/**
+ * Performs validations related to API versioning and time-series stages.
+ * Throws UserAssertion if any of the validations fails
+ *     - validation of API versioning on each stage on the pipeline
+ *     - validation of API versioning on 'AggregateCommand' request
+ *     - validation of time-series related stages
+ */
+void performValidationChecks(const OperationContext* opCtx,
+                             const AggregateCommand& request,
+                             const LiteParsedPipeline& liteParsedPipeline) {
+    liteParsedPipeline.validate(opCtx);
+    aggregation_request_helper::validateRequestForAPIVersion(opCtx, request);
+}
+
 }  // namespace
 
 Status runAggregate(OperationContext* opCtx,
@@ -534,14 +549,9 @@ Status runAggregate(OperationContext* opCtx,
                     const BSONObj& cmdObj,
                     const PrivilegeVector& privileges,
                     rpc::ReplyBuilderInterface* result) {
-    // If 'apiStrict: true', validates that the pipeline does not contain stages which are not in
-    // this API version.
-    auto apiParameters = APIParameters::get(opCtx);
-    if (apiParameters.getAPIStrict().value_or(false)) {
-        auto apiVersion = apiParameters.getAPIVersion();
-        invariant(apiVersion);
-        liteParsedPipeline.validatePipelineStagesIfAPIStrict(*apiVersion);
-    }
+    // Perform some validations on the LiteParsedPipeline and request before continuing with the
+    // aggregation command.
+    performValidationChecks(opCtx, request, liteParsedPipeline);
 
     // For operations on views, this will be the underlying namespace.
     NamespaceString nss = request.getNamespace();
@@ -872,7 +882,6 @@ Status runAggregate(OperationContext* opCtx,
         curOp->setNS_inlock(origNss.ns());
     }
 
-    // Any code that needs the cursor pinned must be inside the try block, above.
     return Status::OK();
 }
 

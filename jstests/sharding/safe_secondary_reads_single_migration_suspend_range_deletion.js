@@ -65,6 +65,7 @@ let testCases = {
     _configsvrMovePrimary: {skip: "primary only"},
     _configsvrRemoveShardFromZone: {skip: "primary only"},
     _configsvrReshardCollection: {skip: "primary only"},
+    _configsvrSetAllowMigrations: {skip: "primary only"},
     _configsvrShardCollection: {skip: "primary only"},
     _configsvrUpdateZoneKeyRange: {skip: "primary only"},
     _flushRoutingTableCacheUpdates: {skip: "does not return user data"},
@@ -75,6 +76,7 @@ let testCases = {
     _killOperations: {skip: "does not return user data"},
     _mergeAuthzCollections: {skip: "primary only"},
     _migrateClone: {skip: "primary only"},
+    _shardsvrFinishReshardCollection: {skip: "does not return user data"},
     _shardsvrMovePrimary: {skip: "primary only"},
     _recvChunkAbort: {skip: "primary only"},
     _recvChunkCommit: {skip: "primary only"},
@@ -381,6 +383,7 @@ let testCases = {
     updateZoneKeyRange: {skip: "primary only"},
     usersInfo: {skip: "primary only"},
     validate: {skip: "does not return user data"},
+    validateDBMetadata: {skip: "does not return user data"},
     waitForFailPoint: {skip: "does not return user data"},
     waitForOngoingChunkSplits: {skip: "does not return user data"},
     whatsmyuri: {skip: "does not return user data"}

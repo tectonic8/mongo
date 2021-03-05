@@ -39,6 +39,7 @@
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/s/resharding/resharding_metrics.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/util/future.h"
 
@@ -53,9 +54,25 @@ class TaskExecutor;
 class OperationContext;
 class ServiceContext;
 
+/**
+ * Responsible for copying data from multiple source shards that will belong to this shard based on
+ * the new resharding chunk distribution.
+ */
 class ReshardingCollectionCloner {
 public:
-    ReshardingCollectionCloner(ShardKeyPattern newShardKeyPattern,
+    class Env {
+    public:
+        explicit Env(ReshardingMetrics* metrics) : _metrics(metrics) {}
+        ReshardingMetrics* metrics() const {
+            return _metrics;
+        }
+
+    private:
+        ReshardingMetrics* _metrics;
+    };
+
+    ReshardingCollectionCloner(std::unique_ptr<Env> env,
+                               ShardKeyPattern newShardKeyPattern,
                                NamespaceString sourceNss,
                                CollectionUUID sourceUUID,
                                ShardId recipientShard,
@@ -71,8 +88,6 @@ public:
                              CancelationToken cancelToken);
 
 private:
-    Value _findHighestInsertedId(OperationContext* opCtx);
-
     std::unique_ptr<Pipeline, PipelineDeleter> _targetAggregationRequest(OperationContext* opCtx,
                                                                          const Pipeline& pipeline);
 
@@ -82,6 +97,7 @@ private:
     template <typename Callable>
     auto _withTemporaryOperationContext(Callable&& callable);
 
+    std::unique_ptr<Env> _env;
     const ShardKeyPattern _newShardKeyPattern;
     const NamespaceString _sourceNss;
     const CollectionUUID _sourceUUID;

@@ -73,6 +73,13 @@ public:
     static constexpr StringData kOrphanCollectionPrefix = "orphan."_sd;
     static constexpr StringData kOrphanCollectionDb = "local"_sd;
 
+    // Prefix for collections that store the local resharding oplog buffer.
+    static constexpr StringData kReshardingLocalOplogBufferPrefix =
+        "localReshardingOplogBuffer."_sd;
+
+    // Prefix for resharding conflict stash collections.
+    static constexpr StringData kReshardingConflictStashPrefix = "localReshardingConflictStash."_sd;
+
     // Prefix for temporary resharding collection.
     static constexpr StringData kTemporaryReshardingCollectionPrefix = "system.resharding."_sd;
 
@@ -142,6 +149,9 @@ public:
 
     // Namespace for the recipient shard's local resharding operation state.
     static const NamespaceString kRecipientReshardingOperationsNamespace;
+
+    // Namespace for persisting sharding DDL coordinators state documents
+    static const NamespaceString kShardingDDLCoordinatorsNamespace;
 
     // Namespace for balancer settings and default read and write concerns.
     static const NamespaceString kConfigSettingsNamespace;
@@ -314,6 +324,16 @@ public:
      * Returns whether the specified namespace is config.cache.chunks.<>.
      */
     bool isConfigDotCacheDotChunks() const;
+
+    /**
+     * Returns whether the specified namespace is config.localReshardingOplogBuffer.<>.
+     */
+    bool isReshardingLocalOplogBufferCollection() const;
+
+    /**
+     * Returns whether the specified namespace is config.localReshardingConflictStash.<>.
+     */
+    bool isReshardingConflictStashCollection() const;
 
     /**
      * Returns whether the specified namespace is <database>.system.resharding.<>.

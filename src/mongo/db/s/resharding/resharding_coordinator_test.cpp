@@ -167,6 +167,7 @@ protected:
         ChunkVersion version(1, 0, epoch, boost::none /* timestamp */);
         ChunkType chunk1(nss, chunkRanges[0], version, ShardId("shard0000"));
         chunk1.setName(ids[0]);
+        version.incMinor();
         ChunkType chunk2(nss, chunkRanges[1], version, ShardId("shard0001"));
         chunk2.setName(ids[1]);
 
@@ -247,6 +248,7 @@ protected:
                           expectedCoordinatorDoc.getReshardingKey().toBSON()),
                       0);
         ASSERT(coordinatorDoc.getState() == expectedCoordinatorDoc.getState());
+        ASSERT(coordinatorDoc.getActive());
         if (expectedCoordinatorDoc.getFetchTimestamp()) {
             ASSERT(coordinatorDoc.getFetchTimestamp());
             ASSERT_EQUALS(coordinatorDoc.getFetchTimestamp().get(),
@@ -530,6 +532,13 @@ protected:
 
             client.createCollection(ChunkType::ConfigNS.ns());
             client.createCollection(TagsType::ConfigNS.ns());
+
+            auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+            ASSERT_OK(configShard->createIndexOnConfig(
+                opCtx,
+                ChunkType::ConfigNS,
+                BSON(ChunkType::ns() << 1 << ChunkType::lastmod() << 1),
+                true));
         }
 
         resharding::insertCoordDocAndChangeOrigCollEntry(opCtx, expectedCoordinatorDoc);
@@ -709,7 +718,7 @@ TEST_F(ReshardingCoordinatorPersistenceTest, BasicStateTransitionSucceeds) {
 
     // Persist the updates on disk
     auto expectedCoordinatorDoc = coordinatorDoc;
-    expectedCoordinatorDoc.setState(CoordinatorStateEnum::kMirroring);
+    expectedCoordinatorDoc.setState(CoordinatorStateEnum::kBlockingWrites);
 
     writeStateTransitionUpdateExpectSuccess(operationContext(), expectedCoordinatorDoc);
     assertChunkVersionIncreasedAfterStateTransition(donorChunk, collectionVersion);
@@ -735,7 +744,7 @@ TEST_F(ReshardingCoordinatorPersistenceTest, StateTransitionWithFetchTimestampSu
 TEST_F(ReshardingCoordinatorPersistenceTest, StateTranstionToDecisionPersistedSucceeds) {
     Timestamp fetchTimestamp = Timestamp(1, 1);
     auto coordinatorDoc = insertStateAndCatalogEntries(
-        CoordinatorStateEnum::kMirroring, _originalEpoch, fetchTimestamp);
+        CoordinatorStateEnum::kBlockingWrites, _originalEpoch, fetchTimestamp);
     auto initialChunksIds = std::vector{OID::gen(), OID::gen()};
 
     auto tempNssChunks = makeChunks(_tempNss, _tempEpoch, _newShardKey, initialChunksIds);
@@ -766,6 +775,10 @@ TEST_F(ReshardingCoordinatorPersistenceTest, StateTranstionToDecisionPersistedSu
 TEST_F(ReshardingCoordinatorPersistenceTest, StateTransitionToErrorSucceeds) {
     auto coordinatorDoc =
         insertStateAndCatalogEntries(CoordinatorStateEnum::kPreparingToDonate, _originalEpoch);
+
+    insertChunkAndZoneEntries(
+        makeChunks(_originalNss, OID::gen(), _oldShardKey, std::vector{OID::gen(), OID::gen()}),
+        makeZones(_originalNss, _oldShardKey));
 
     // Persist the updates on disk
     auto expectedCoordinatorDoc = coordinatorDoc;

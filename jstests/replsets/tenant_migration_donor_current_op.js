@@ -17,16 +17,56 @@ load("jstests/replsets/libs/tenant_migration_test.js");
 // An object that mirrors the donor migration states.
 const migrationStates = {
     kUninitialized: 0,
-    kDataSync: 1,
-    kBlocking: 2,
-    kCommitted: 3,
-    kAborted: 4
+    kAbortingIndexBuilds: 1,
+    kDataSync: 2,
+    kBlocking: 3,
+    kCommitted: 4,
+    kAborted: 5
 };
 
 const kTenantId = 'testTenantId';
 const kReadPreference = {
     mode: "primary"
 };
+
+(() => {
+    jsTestLog("Testing currentOp output for migration in data sync state");
+    const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
+    if (!tenantMigrationTest.isFeatureFlagEnabled()) {
+        jsTestLog("Skipping test because the tenant migrations feature flag is disabled");
+        return;
+    }
+
+    const donorPrimary = tenantMigrationTest.getDonorPrimary();
+
+    const migrationId = UUID();
+    const migrationOpts = {
+        migrationIdString: extractUUIDFromObject(migrationId),
+        tenantId: kTenantId,
+        readPreference: kReadPreference
+    };
+    let fp = configureFailPoint(donorPrimary,
+                                "pauseTenantMigrationBeforeLeavingAbortingIndexBuildsState");
+    assert.commandWorked(tenantMigrationTest.startMigration(migrationOpts));
+    fp.wait();
+
+    const res = assert.commandWorked(
+        donorPrimary.adminCommand({currentOp: true, desc: "tenant donor migration"}));
+    assert.eq(res.inprog.length, 1);
+    assert.eq(bsonWoCompare(res.inprog[0].instanceID.uuid, migrationId), 0);
+    assert.eq(bsonWoCompare(res.inprog[0].tenantId, kTenantId), 0);
+    assert.eq(res.inprog[0].recipientConnectionString,
+              tenantMigrationTest.getRecipientRst().getURL());
+    assert.eq(bsonWoCompare(res.inprog[0].readPreference, kReadPreference), 0);
+    assert.eq(res.inprog[0].lastDurableState, migrationStates.kAbortingIndexBuilds);
+    assert.eq(res.inprog[0].migrationCompleted, false);
+    assert(res.inprog[0].migrationStart);
+    assert(res.inprog[0].migrationStart instanceof Date);
+
+    fp.off();
+    assert.commandWorked(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
+    tenantMigrationTest.stop();
+})();
 
 (() => {
     jsTestLog("Testing currentOp output for migration in data sync state");
@@ -57,7 +97,10 @@ const kReadPreference = {
               tenantMigrationTest.getRecipientRst().getURL());
     assert.eq(bsonWoCompare(res.inprog[0].readPreference, kReadPreference), 0);
     assert.eq(res.inprog[0].lastDurableState, migrationStates.kDataSync);
+    assert(res.inprog[0].startMigrationDonorTimestamp);
     assert.eq(res.inprog[0].migrationCompleted, false);
+    assert(res.inprog[0].migrationStart);
+    assert(res.inprog[0].migrationStart instanceof Date);
 
     fp.off();
     assert.commandWorked(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
@@ -92,8 +135,11 @@ const kReadPreference = {
               tenantMigrationTest.getRecipientRst().getURL());
     assert.eq(bsonWoCompare(res.inprog[0].readPreference, kReadPreference), 0);
     assert.eq(res.inprog[0].lastDurableState, migrationStates.kBlocking);
+    assert(res.inprog[0].startMigrationDonorTimestamp);
     assert(res.inprog[0].blockTimestamp);
     assert.eq(res.inprog[0].migrationCompleted, false);
+    assert(res.inprog[0].migrationStart);
+    assert(res.inprog[0].migrationStart instanceof Date);
 
     fp.off();
     assert.commandWorked(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
@@ -128,10 +174,14 @@ const kReadPreference = {
               tenantMigrationTest.getRecipientRst().getURL());
     assert.eq(bsonWoCompare(res.inprog[0].readPreference, kReadPreference), 0);
     assert.eq(res.inprog[0].lastDurableState, migrationStates.kAborted);
+    assert(res.inprog[0].startMigrationDonorTimestamp);
     assert(res.inprog[0].blockTimestamp);
     assert(res.inprog[0].commitOrAbortOpTime);
     assert(res.inprog[0].abortReason);
     assert.eq(res.inprog[0].migrationCompleted, false);
+    assert(res.inprog[0].migrationStart);
+    assert(res.inprog[0].migrationStart instanceof Date);
+
     tenantMigrationTest.stop();
 })();
 
@@ -162,9 +212,12 @@ const kReadPreference = {
               tenantMigrationTest.getRecipientRst().getURL());
     assert.eq(bsonWoCompare(res.inprog[0].readPreference, kReadPreference), 0);
     assert.eq(res.inprog[0].lastDurableState, migrationStates.kCommitted);
+    assert(res.inprog[0].startMigrationDonorTimestamp);
     assert(res.inprog[0].blockTimestamp);
     assert(res.inprog[0].commitOrAbortOpTime);
     assert.eq(res.inprog[0].migrationCompleted, false);
+    assert(res.inprog[0].migrationStart);
+    assert(res.inprog[0].migrationStart instanceof Date);
 
     jsTestLog("Testing currentOp output for a committed migration after donorForgetMigration");
 
@@ -178,10 +231,14 @@ const kReadPreference = {
               tenantMigrationTest.getRecipientRst().getURL());
     assert.eq(bsonWoCompare(res.inprog[0].readPreference, kReadPreference), 0);
     assert.eq(res.inprog[0].lastDurableState, migrationStates.kCommitted);
+    assert(res.inprog[0].startMigrationDonorTimestamp);
     assert(res.inprog[0].blockTimestamp);
     assert(res.inprog[0].commitOrAbortOpTime);
     assert(res.inprog[0].expireAt);
     assert.eq(res.inprog[0].migrationCompleted, true);
+    assert(res.inprog[0].migrationStart);
+    assert(res.inprog[0].migrationStart instanceof Date);
+
     tenantMigrationTest.stop();
 })();
 })();

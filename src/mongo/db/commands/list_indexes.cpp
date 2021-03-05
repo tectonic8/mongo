@@ -32,9 +32,11 @@
 #include "mongo/platform/basic.h"
 
 #include <memory>
+#include <utility>
 
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/list_indexes.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
@@ -47,6 +49,7 @@
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/list_indexes_gen.h"
+#include "mongo/db/pipeline/document_source_internal_unpack_bucket.h"
 #include "mongo/db/query/cursor_request.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/find_common.h"
@@ -54,17 +57,179 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/views/view_catalog.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
-
-using std::string;
-using std::stringstream;
-using std::unique_ptr;
-using std::vector;
-
 namespace {
+
+/**
+ * Returns time-series options if 'ns' refers to a time-series collection.
+ */
+boost::optional<TimeseriesOptions> getTimeseriesOptions(
+    OperationContext* opCtx, const boost::optional<NamespaceString>& ns) {
+    if (!ns) {
+        return {};
+    }
+
+    auto viewCatalog = DatabaseHolder::get(opCtx)->getViewCatalog(opCtx, ns->db());
+    if (!viewCatalog) {
+        return {};
+    }
+
+    auto view = viewCatalog->lookupWithoutValidatingDurableViews(opCtx, ns->ns());
+    if (!view) {
+        return {};
+    }
+
+    // Return a copy of the time-series options so that we don't refer to the internal state of
+    // 'viewCatalog' once it goes out of scope.
+    return view->timeseries();
+}
+
+/**
+ * Returns an index key with field names mapped from the bucket collection schema.
+ * Returns an empty BSONObj if the index key cannot be converted.
+ */
+BSONObj makeTimeseriesIndexSpecKey(const TimeseriesOptions& timeseriesOptions,
+                                   const BSONObj& origKey) {
+    auto timeField = timeseriesOptions.getTimeField();
+    auto metaField = timeseriesOptions.getMetaField();
+
+    std::string controlMinTimeField = str::stream() << "control.min." << timeField;
+    std::string controlMaxTimeField = str::stream() << "control.max." << timeField;
+
+    BSONObjBuilder builder;
+    for (const auto& elem : origKey) {
+        // Determine if the index requested on the time field is ascending or descending.
+        // The final index spec will be subjected to a more complete validation in
+        // index_key_validate::validateKeyPattern().
+        if (elem.fieldNameStringData() == controlMinTimeField) {
+            if (!elem.isNumber()) {
+                return {};
+            }
+            builder.appendAs(elem, timeField);
+            continue;
+        } else if (elem.fieldNameStringData() == controlMaxTimeField) {
+            // Skip control.max.<timeField> since the control.min.<timeField> field is enough to
+            // figure out the direction of the index (ascending/descending).
+            continue;
+        }
+
+        if (!metaField) {
+            return {};
+        }
+
+        if (elem.fieldNameStringData() == BucketUnpacker::kBucketMetaFieldName) {
+            builder.appendAs(elem, *metaField);
+            continue;
+        }
+
+        if (elem.fieldNameStringData().startsWith(BucketUnpacker::kBucketMetaFieldName + ".")) {
+            builder.appendAs(elem,
+                             str::stream() << *metaField << "."
+                                           << elem.fieldNameStringData().substr(
+                                                  BucketUnpacker::kBucketMetaFieldName.size() + 1));
+            continue;
+        }
+
+        return {};
+    }
+    return builder.obj();
+}
+
+/**
+ * Returns a list of index specs mapped from the bucket collection schema.
+ */
+std::list<BSONObj> makeTimeseriesIndexSpecs(const TimeseriesOptions& timeseriesOptions,
+                                            const std::list<BSONObj>& bucketIndexSpecs) {
+    std::list<BSONObj> indexSpecs;
+    for (const auto& bucketIndexSpec : bucketIndexSpecs) {
+        // TODO(SERVER-54639): Map index specs from bucket collection using helper function.
+        BSONObjBuilder builder;
+        bool skip = false;
+        for (const auto& elem : bucketIndexSpec) {
+            if (elem.fieldNameStringData() == ListIndexesReplyItem::kKeyFieldName) {
+                // On a time-series collection with 'tm' time field and 'mm' metadata field,
+                // we may see a compound index on the underlying bucket collection mapped from:
+                // {
+                //     'meta.tag1': 1,
+                //     'control.min.tm': 1,
+                //     'control.max.tm': 1
+                // }
+                // to an index on the time-series collection:
+                // {
+                //     'mm.tag1': 1,
+                //     tm: 1
+                // }
+                auto key = makeTimeseriesIndexSpecKey(timeseriesOptions, elem.Obj());
+                if (key.isEmpty()) {
+                    // Skip index spec due to failed conversion.
+                    skip = true;
+                    break;
+                }
+                builder.append(ListIndexesReplyItem::kKeyFieldName, key);
+                continue;
+            }
+            // Besides 'key', fields such as 'v' and 'name' commonly appear in the spec.
+            // Depending on the index options, other fields that may be appended here
+            // include 'sparse', 'hidden', 'collation'.
+            // {
+            //    v: 2,
+            //    name: 'mm_1',
+            //    ...
+            //    sparse: true,
+            //    ...
+            // }
+            // For a complete list, refer to:
+            // https://docs.mongodb.com/manual/reference/method/db.collection.createIndex/#options-for-all-index-types
+            builder.append(elem);
+        }
+        if (skip) {
+            continue;
+        }
+        indexSpecs.push_back(builder.obj());
+    }
+    return indexSpecs;
+}
+
+/**
+ * Returns index specs, with resolved namespace, from the catalog for this listIndexes request.
+ */
+using IndexSpecsWithNamespaceString = std::pair<std::list<BSONObj>, NamespaceString>;
+IndexSpecsWithNamespaceString getIndexSpecsWithNamespaceString(OperationContext* opCtx,
+                                                               const ListIndexes& cmd) {
+    const auto& origNssOrUUID = cmd.getNamespaceOrUUID();
+
+    // Since time-series collections don't have UUIDs, we skip the time-series lookup
+    // if the target collection is specified as a UUID.
+    if (const auto& origNss = origNssOrUUID.nss();
+        auto timeseriesOptions = getTimeseriesOptions(opCtx, origNss)) {
+        auto bucketsNss = origNss->makeTimeseriesBucketsNamespace();
+        AutoGetCollectionForReadCommandMaybeLockFree autoColl(opCtx, bucketsNss);
+
+        const CollectionPtr& coll = autoColl.getCollection();
+        uassert(ErrorCodes::NamespaceNotFound,
+                str::stream() << "ns does not exist: " << bucketsNss,
+                coll);
+
+        return std::make_pair(
+            makeTimeseriesIndexSpecs(
+                *timeseriesOptions,
+                listIndexesInLock(opCtx, coll, bucketsNss, cmd.getIncludeBuildUUIDs())),
+            *origNss);
+    }
+
+    AutoGetCollectionForReadCommandMaybeLockFree autoColl(opCtx, origNssOrUUID);
+
+    const auto& nss = autoColl.getNss();
+    const CollectionPtr& coll = autoColl.getCollection();
+    uassert(
+        ErrorCodes::NamespaceNotFound, str::stream() << "ns does not exist: " << nss.ns(), coll);
+
+    return std::make_pair(listIndexesInLock(opCtx, coll, nss, cmd.getIncludeBuildUUIDs()), nss);
+}
 
 /**
  * Lists the indexes for a given collection.
@@ -152,6 +317,21 @@ public:
 
         ListIndexesReply typedRun(OperationContext* opCtx) final {
             CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
+            auto indexSpecsWithNss = getIndexSpecsWithNamespaceString(opCtx, request());
+            const auto& indexList = indexSpecsWithNss.first;
+            const auto& nss = indexSpecsWithNss.second;
+            return ListIndexesReply(_makeCursor(opCtx, indexList, nss));
+        }
+
+    private:
+        /**
+         * Constructs a cursor that iterates the index specs found in 'indexSpecsWithNss'.
+         * This function does not hold any locks because it does not access in-memory
+         * or on-disk data.
+         */
+        ListIndexesReplyCursor _makeCursor(OperationContext* opCtx,
+                                           const std::list<BSONObj>& indexList,
+                                           const NamespaceString& nss) {
             auto& cmd = request();
 
             long long batchSize = std::numeric_limits<long long>::max();
@@ -159,84 +339,70 @@ public:
                 batchSize = *cmd.getCursor()->getBatchSize();
             }
 
-            NamespaceString nss;
-            std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
+            auto expCtx = make_intrusive<ExpressionContext>(
+                opCtx, std::unique_ptr<CollatorInterface>(nullptr), nss);
+
+            auto ws = std::make_unique<WorkingSet>();
+            auto root = std::make_unique<QueuedDataStage>(expCtx.get(), ws.get());
+
+            for (auto&& indexSpec : indexList) {
+                WorkingSetID id = ws->allocate();
+                WorkingSetMember* member = ws->get(id);
+                member->keyData.clear();
+                member->recordId = RecordId();
+                member->resetDocument(SnapshotId(), indexSpec.getOwned());
+                member->transitionToOwnedObj();
+                root->pushBack(id);
+            }
+
+            auto exec = uassertStatusOK(
+                plan_executor_factory::make(expCtx,
+                                            std::move(ws),
+                                            std::move(root),
+                                            &CollectionPtr::null,
+                                            PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                            false, /* whether returned BSON must be owned */
+                                            nss));
+
             std::vector<mongo::ListIndexesReplyItem> firstBatch;
-            {
-                AutoGetCollectionForReadCommandMaybeLockFree collection(opCtx,
-                                                                        cmd.getNamespaceOrUUID());
-                uassert(ErrorCodes::NamespaceNotFound,
-                        str::stream() << "ns does not exist: " << collection.getNss().ns(),
-                        collection);
-                nss = collection.getNss();
+            int bytesBuffered = 0;
+            for (long long objCount = 0; objCount < batchSize; objCount++) {
+                BSONObj nextDoc;
+                PlanExecutor::ExecState state = exec->getNext(&nextDoc, nullptr);
+                if (state == PlanExecutor::IS_EOF) {
+                    break;
+                }
+                invariant(state == PlanExecutor::ADVANCED);
 
-                auto expCtx = make_intrusive<ExpressionContext>(
-                    opCtx, std::unique_ptr<CollatorInterface>(nullptr), nss);
-
-                auto indexList = listIndexesInLock(
-                    opCtx, collection.getCollection(), nss, cmd.getIncludeBuildUUIDs());
-                auto ws = std::make_unique<WorkingSet>();
-                auto root = std::make_unique<QueuedDataStage>(expCtx.get(), ws.get());
-
-                for (auto&& indexSpec : indexList) {
-                    WorkingSetID id = ws->allocate();
-                    WorkingSetMember* member = ws->get(id);
-                    member->keyData.clear();
-                    member->recordId = RecordId();
-                    member->resetDocument(SnapshotId(), indexSpec.getOwned());
-                    member->transitionToOwnedObj();
-                    root->pushBack(id);
+                // If we can't fit this result inside the current batch, then we stash it for
+                // later.
+                if (!FindCommon::haveSpaceForNext(nextDoc, objCount, bytesBuffered)) {
+                    exec->enqueue(nextDoc);
+                    break;
                 }
 
-                exec = uassertStatusOK(
-                    plan_executor_factory::make(expCtx,
-                                                std::move(ws),
-                                                std::move(root),
-                                                &CollectionPtr::null,
-                                                PlanYieldPolicy::YieldPolicy::NO_YIELD,
-                                                false, /* whether returned BSON must be owned */
-                                                nss));
-
-                int bytesBuffered = 0;
-                for (long long objCount = 0; objCount < batchSize; objCount++) {
-                    BSONObj nextDoc;
-                    PlanExecutor::ExecState state = exec->getNext(&nextDoc, nullptr);
-                    if (state == PlanExecutor::IS_EOF) {
-                        break;
-                    }
-                    invariant(state == PlanExecutor::ADVANCED);
-
-                    // If we can't fit this result inside the current batch, then we stash it for
-                    // later.
-                    if (!FindCommon::haveSpaceForNext(nextDoc, objCount, bytesBuffered)) {
-                        exec->enqueue(nextDoc);
-                        break;
-                    }
-
-                    try {
-                        firstBatch.push_back(ListIndexesReplyItem::parse(
-                            IDLParserErrorContext("ListIndexesReplyItem"), nextDoc));
-                    } catch (const DBException& exc) {
-                        LOGV2_ERROR(5254500,
-                                    "Could not parse catalog entry while replying to listIndexes",
-                                    "entry"_attr = nextDoc,
-                                    "error"_attr = exc);
-                        uasserted(5254501,
-                                  "Could not parse catalog entry while replying to listIndexes");
-                    }
-                    bytesBuffered += nextDoc.objsize();
+                try {
+                    firstBatch.push_back(ListIndexesReplyItem::parse(
+                        IDLParserErrorContext("ListIndexesReplyItem"), nextDoc));
+                } catch (const DBException& exc) {
+                    LOGV2_ERROR(5254500,
+                                "Could not parse catalog entry while replying to listIndexes",
+                                "entry"_attr = nextDoc,
+                                "error"_attr = exc);
+                    uasserted(5254501,
+                              "Could not parse catalog entry while replying to listIndexes");
                 }
+                bytesBuffered += nextDoc.objsize();
+            }
 
-                if (exec->isEOF()) {
-                    return ListIndexesReply(
-                        ListIndexesReplyCursor(0 /* cursorId */, nss, std::move(firstBatch)));
-                }
+            if (exec->isEOF()) {
+                return ListIndexesReplyCursor(0 /* cursorId */, nss, std::move(firstBatch));
+            }
 
-                exec->saveState();
-                exec->detachFromOperationContext();
-            }  // Drop collection lock. Global cursor registration must be done without holding any
-            // locks.
+            exec->saveState();
+            exec->detachFromOperationContext();
 
+            // Global cursor registration must be done without holding any locks.
             auto pinnedCursor = CursorManager::get(opCtx)->registerCursor(
                 opCtx,
                 {std::move(exec),
@@ -251,8 +417,8 @@ public:
             pinnedCursor->incNBatches();
             pinnedCursor->incNReturnedSoFar(firstBatch.size());
 
-            return ListIndexesReply(ListIndexesReplyCursor(
-                pinnedCursor.getCursor()->cursorid(), nss, std::move(firstBatch)));
+            return ListIndexesReplyCursor(
+                pinnedCursor.getCursor()->cursorid(), nss, std::move(firstBatch));
         }
     };
 } cmdListIndexes;

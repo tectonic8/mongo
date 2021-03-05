@@ -2593,7 +2593,7 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinRegexFindAll(Ar
 
     int resultSize = 0;
     do {
-        auto [owned, matchTag, matchVal] = [&]() {
+        auto [_, matchTag, matchVal] = [&]() {
             if (isFirstMatch) {
                 isFirstMatch = false;
                 return pcreFirstMatch(
@@ -2601,6 +2601,7 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinRegexFindAll(Ar
             }
             return pcreNextMatch(pcre, inputString, capturesBuffer, startBytePos, codePointPos);
         }();
+        value::ValueGuard matchGuard{matchTag, matchVal};
 
         if (matchTag == value::TypeTags::Null) {
             break;
@@ -2614,6 +2615,7 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinRegexFindAll(Ar
                 "$regexFindAll: the size of buffer to store output exceeded the 64MB limit",
                 resultSize <= mongo::BufferMaxSize);
 
+        matchGuard.reset();
         arrayView->push_back(matchTag, matchVal);
 
         // Move indexes after the current matched string to prepare for the next search.
@@ -2640,7 +2642,7 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinShardFilter(Ari
     auto [ownedFilter, filterTag, filterValue] = getFromStack(0);
     auto [ownedShardKey, shardKeyTag, shardKeyValue] = getFromStack(1);
 
-    if (filterTag != value::TypeTags::shardFilterer || shardKeyTag != value::TypeTags::Object) {
+    if (filterTag != value::TypeTags::shardFilterer || shardKeyTag != value::TypeTags::bsonObject) {
         if (filterTag == value::TypeTags::shardFilterer &&
             shardKeyTag == value::TypeTags::Nothing) {
             LOGV2_WARNING(5071200,
@@ -2652,13 +2654,11 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinShardFilter(Ari
         return {false, value::TypeTags::Nothing, 0};
     }
 
-    BSONObjBuilder bob;
-    bson::convertToBsonObj(bob, value::getObjectView(shardKeyValue));
-
+    BSONObj keyAsUnownedBson{sbe::value::bitcastTo<const char*>(shardKeyValue)};
     return {false,
             value::TypeTags::Boolean,
             value::bitcastFrom<bool>(
-                value::getShardFiltererView(filterValue)->keyBelongsToMe(bob.done()))};
+                value::getShardFiltererView(filterValue)->keyBelongsToMe(keyAsUnownedBson))};
 }
 
 std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinExtractSubArray(ArityType arity) {
@@ -2832,6 +2832,65 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinGetRegexFlags(A
     auto [strType, strValue] = value::makeNewString(regex.flags);
 
     return {true, strType, strValue};
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinReverseArray(ArityType arity) {
+    invariant(arity == 1);
+    auto [inputOwned, inputType, inputVal] = getFromStack(0);
+
+    if (!value::isArray(inputType)) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+
+    auto [resultTag, resultVal] = value::makeNewArray();
+    auto resultView = value::getArrayView(resultVal);
+    value::ValueGuard resultGuard{resultTag, resultVal};
+
+    if (inputType == value::TypeTags::Array) {
+        auto inputView = value::getArrayView(inputVal);
+        size_t inputSize = inputView->size();
+        resultView->reserve(inputSize);
+        for (size_t i = 0; i < inputSize; i++) {
+            auto [origTag, origVal] = inputView->getAt(inputSize - 1 - i);
+            auto [copyTag, copyVal] = copyValue(origTag, origVal);
+            resultView->push_back(copyTag, copyVal);
+        }
+
+        resultGuard.reset();
+        return {true, resultTag, resultVal};
+    } else if (inputType == value::TypeTags::bsonArray || inputType == value::TypeTags::ArraySet) {
+        value::ArrayEnumerator enumerator{inputType, inputVal};
+
+        // Using intermediate vector since bsonArray and ArraySet don't
+        // support reverse iteration.
+        std::vector<std::pair<value::TypeTags, value::Value>> inputContents;
+
+        if (inputType == value::TypeTags::ArraySet) {
+            // Reserve space to avoid resizing on push_back calls.
+            auto arraySetView = value::getArraySetView(inputVal);
+            inputContents.reserve(arraySetView->size());
+            resultView->reserve(arraySetView->size());
+        }
+
+        while (!enumerator.atEnd()) {
+            inputContents.push_back(enumerator.getViewOfValue());
+            enumerator.advance();
+        }
+
+        // Run through the array backwards and copy into the result array.
+        for (auto it = inputContents.rbegin(); it != inputContents.rend(); ++it) {
+            auto [copyTag, copyVal] = copyValue(it->first, it->second);
+            resultView->push_back(copyTag, copyVal);
+        }
+
+        resultGuard.reset();
+        return {true, resultTag, resultVal};
+    } else {
+        // Earlier in this function we bailed out if the `inputType` wasn't
+        // Array, ArraySet or bsonArray, so it should be impossible to reach
+        // this point.
+        MONGO_UNREACHABLE;
+    }
 }
 
 std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinDateAdd(ArityType arity) {
@@ -3021,6 +3080,8 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::dispatchBuiltin(Builti
             return builtinExtractSubArray(arity);
         case Builtin::isArrayEmpty:
             return builtinIsArrayEmpty(arity);
+        case Builtin::reverseArray:
+            return builtinReverseArray(arity);
         case Builtin::dateAdd:
             return builtinDateAdd(arity);
         case Builtin::hasNullBytes:

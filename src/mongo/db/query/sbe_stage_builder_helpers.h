@@ -202,6 +202,9 @@ inline auto makeConstant(std::string_view str) {
     return sbe::makeE<sbe::EConstant>(tag, value);
 }
 
+std::unique_ptr<sbe::EExpression> makeVariable(sbe::value::SlotId slotId,
+                                               boost::optional<sbe::FrameId> frameId = {});
+
 /**
  * Check if expression returns Nothing and return null if so. Otherwise, return the
  * expression.
@@ -687,4 +690,60 @@ EvalExprStagePair generateShortCircuitingLogicalOp(sbe::EPrimBinary::Op logicOp,
                                                    sbe::value::SlotIdGenerator* slotIdGenerator,
                                                    const FilterStateHelper& stateHelper);
 
+/**
+ * Imagine that we have some parent QuerySolutionNode X and child QSN Y which both participate in a
+ * covered plan. Stage X requests some slots to be constructed out of the index keys using
+ * 'parentIndexKeyReqs'. Stage Y requests it's own slots, and adds those to the set requested by X,
+ * resulting in 'childIndexKeyReqs'. Note the invariant that 'childIndexKeyReqs' is a superset of
+ * 'parentIndexKeyReqs'. Let's notate the number of slots requested by 'childIndexKeyReqs' as |Y|
+ * and the set of slots requested by 'parentIndexKeyReqs' as |X|.
+ *
+ * The underlying SBE plan is constructed, and returns a vector of |Y| slots. However, the parent
+ * stage expects a vector of just |X| slots. The purpose of this function is to calculate and return
+ * the appropriate subset of the slot vector so that the parent stage X receives its expected |X|
+ * slots.
+ *
+ * As a concrete example, let's say the QSN tree is X => Y => IXSCAN and the index key pattern is
+ * {a: 1, b: 1, c: 1, d: 1}. X requests "a" and "d" using the bit vector 1001. Y additionally
+ * requires "c" so it requests three slots with the bit vector 1011. As a result, Y receives a
+ * 3-element slot vector, <s1, s2, s3>. Here, s1 will contain the value of "a", s2 contains "c", and
+ * s3 contain s"d".
+ *
+ * Parent QSN X expects just a two element slot vector where the first slot is for "a" and the
+ * second is for "d". This function would therefore return the slot vector <s1, s3>.
+ */
+sbe::value::SlotVector makeIndexKeyOutputSlotsMatchingParentReqs(
+    const BSONObj& indexKeyPattern,
+    sbe::IndexKeysInclusionSet parentIndexKeyReqs,
+    sbe::IndexKeysInclusionSet childIndexKeyReqs,
+    sbe::value::SlotVector childOutputSlots);
+
+/**
+ * Given an index key pattern, and a subset of the fields of the index key pattern that are depended
+ * on to compute the query, returns the corresponding 'IndexKeysInclusionSet' bit vector and field
+ * name vector.
+ *
+ * For example, suppose that we have an index key pattern {d: 1, c: 1, b: 1, a: 1}, and the caller
+ * depends on the set of 'requiredFields' {"b", "d"}. In this case, the pair of return values would
+ * be:
+ *  - 'IndexKeysInclusionSet' bit vector of 1010
+ *  - Field name vector of <"d", "b">
+ */
+template <typename T>
+std::pair<sbe::IndexKeysInclusionSet, std::vector<std::string>> makeIndexKeyInclusionSet(
+    const BSONObj& indexKeyPattern, const T& requiredFields) {
+    sbe::IndexKeysInclusionSet indexKeyBitset;
+    std::vector<std::string> keyFieldNames;
+    size_t i = 0;
+    for (auto&& elt : indexKeyPattern) {
+        if (requiredFields.count(elt.fieldName())) {
+            indexKeyBitset.set(i);
+            keyFieldNames.push_back(elt.fieldName());
+        }
+
+        ++i;
+    }
+
+    return {std::move(indexKeyBitset), std::move(keyFieldNames)};
+}
 }  // namespace mongo::stage_builder

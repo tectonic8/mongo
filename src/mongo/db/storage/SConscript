@@ -105,16 +105,6 @@ env.Library(
     )
 
 env.Library(
-    target='oplog_hack',
-    source=[
-        'oplog_hack.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-    ],
-)
-
-env.Library(
     target='storage_control',
     source=[
         'control/storage_control.cpp',
@@ -219,6 +209,7 @@ env.Library(
         'sorted_data_interface_test_harness.cpp',
         'sorted_data_interface_test_insert.cpp',
         'sorted_data_interface_test_isempty.cpp',
+        'sorted_data_interface_test_keyformat_string.cpp',
         'sorted_data_interface_test_rollback.cpp',
         'sorted_data_interface_test_spaceused.cpp',
         'sorted_data_interface_test_unindex.cpp',
@@ -571,6 +562,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/storage/storage_options',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/audit',
         '$BUILD_DIR/mongo/db/catalog/collection_catalog_helper',
         '$BUILD_DIR/mongo/db/resumable_index_builds_idl',
         '$BUILD_DIR/mongo/db/storage/storage_repair_observer',

@@ -53,10 +53,7 @@
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/s/active_migrations_registry.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
-#include "mongo/db/s/migration_util.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/logv2/log.h"
@@ -122,6 +119,20 @@ void checkInitialSyncFinished(OperationContext* opCtx) {
         replCoord->awaitReplication(opCtx, fakeOpTime, writeConcern).status,
         "Failed to wait for the current replica set config to propagate to all nodes");
     LOGV2(4637905, "The current replica set config has been propagated to all nodes.");
+}
+
+void waitForCurrentConfigCommitment(OperationContext* opCtx) {
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+
+    // Skip the waiting if the current config is from a force reconfig.
+    auto oplogWait = replCoord->getConfig().getConfigTerm() != repl::OpTime::kUninitializedTerm;
+    auto status = replCoord->awaitConfigCommitment(opCtx, oplogWait);
+    status.addContext("New feature compatibility version is rejected");
+    if (status == ErrorCodes::MaxTimeMSExpired) {
+        // Convert the error code to be more specific.
+        uasserted(ErrorCodes::CurrentConfigNotCommittedYet, status.reason());
+    }
+    uassertStatusOK(status);
 }
 
 /**
@@ -259,6 +270,9 @@ public:
             // reconfig to change the 'slaveDelay' field to 'secondaryDelaySecs'.
             if (isReplSet && repl::feature_flags::gUseSecondaryDelaySecs.isEnabledAndIgnoreFCV() &&
                 requestedVersion == ServerGlobalParams::FeatureCompatibility::kLatest) {
+                // Wait for the current config to be committed before starting a new reconfig.
+                waitForCurrentConfigCommitment(opCtx);
+
                 auto getNewConfig = [&](const repl::ReplSetConfig& oldConfig, long long term) {
                     auto newConfig = oldConfig.getMutable();
                     newConfig.setConfigVersion(newConfig.getConfigVersion() + 1);
@@ -268,22 +282,12 @@ public:
                     }
                     return repl::ReplSetConfig(std::move(newConfig));
                 };
-                auto status = replCoord->doReplSetReconfig(opCtx, getNewConfig, true /* force */);
+                auto status = replCoord->doReplSetReconfig(opCtx, getNewConfig, false /* force */);
                 uassertStatusOKWithContext(status, "Failed to upgrade the replica set config");
 
-                LOGV2(5042301,
-                      "Waiting for the upgraded replica set config to propagate to a majority");
-                // If a write concern is given, we'll use its wTimeout. It's kNoTimeout by default.
-                WriteConcernOptions writeConcern(
-                    repl::ReplSetConfig::kConfigMajorityWriteConcernModeName,
-                    WriteConcernOptions::SyncMode::NONE,
-                    opCtx->getWriteConcern().wTimeout);
-                writeConcern.checkCondition = WriteConcernOptions::CheckCondition::Config;
-                repl::OpTime fakeOpTime(Timestamp(1, 1), replCoord->getTerm());
                 uassertStatusOKWithContext(
-                    replCoord->awaitReplication(opCtx, fakeOpTime, writeConcern).status,
-                    "Failed to wait for the upgraded replica set config to propagate to a "
-                    "majority");
+                    replCoord->awaitConfigCommitment(opCtx, true /* waitForOplogCommitment */),
+                    "The upgraded replica set config failed to propagate to a majority");
                 LOGV2(5042302, "The upgraded replica set config has been propagated to a majority");
             }
 
@@ -308,19 +312,7 @@ public:
             }
 
             if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-                if (requestedVersion >= FeatureCompatibilityParams::Version::kVersion49) {
-                    // SERVER-52630: Remove once 5.0 becomes the LastLTS
-                    ShardingCatalogManager::get(opCtx)->removePre49LegacyMetadata(opCtx);
-                }
-
-                // Upgrade shards before config finishes its upgrade.
-                uassertStatusOK(
-                    ShardingCatalogManager::get(opCtx)->setFeatureCompatibilityVersionOnShards(
-                        opCtx, CommandHelpers::appendMajorityWriteConcern(request.toBSON({}))));
-
-                // Amend metadata created before FCV 4.9. This must be done after all shards have
-                // been upgraded to 4.9 in order to guarantee that when the metadata is amended, no
-                // new databases or collections with the old version of the metadata will be added.
+                // Upgrade metadata created before FCV 4.9.
                 // TODO SERVER-53283: Remove once 5.0 has been released.
                 if (requestedVersion >= FeatureCompatibilityParams::Version::kVersion49) {
                     try {
@@ -332,6 +324,11 @@ public:
                         throw;
                     }
                 }
+
+                // Upgrade shards after config finishes its upgrade.
+                uassertStatusOK(
+                    ShardingCatalogManager::get(opCtx)->setFeatureCompatibilityVersionOnShards(
+                        opCtx, CommandHelpers::appendMajorityWriteConcern(request.toBSON({}))));
             }
 
             hangWhileUpgrading.pauseWhileSet(opCtx);
@@ -351,7 +348,7 @@ public:
                 if (!viewCatalog) {
                     continue;
                 }
-                viewCatalog->iterate(opCtx, [](const ViewDefinition& view) {
+                viewCatalog->iterate([](const ViewDefinition& view) {
                     uassert(ErrorCodes::CannotDowngrade,
                             str::stream()
                                 << "Cannot downgrade the cluster when there are time-series "
@@ -359,6 +356,7 @@ public:
                                    "downgrading. First detected time-series collection: "
                                 << view.name(),
                             !view.timeseries());
+                    return true;
                 });
             }
 
@@ -377,6 +375,9 @@ public:
             // a reconfig to change the 'secondaryDelaySecs' field to 'slaveDelay'.
             if (isReplSet && repl::feature_flags::gUseSecondaryDelaySecs.isEnabledAndIgnoreFCV() &&
                 requestedVersion < repl::feature_flags::gUseSecondaryDelaySecs.getVersion()) {
+                // Wait for the current config to be committed before starting a new reconfig.
+                waitForCurrentConfigCommitment(opCtx);
+
                 auto getNewConfig = [&](const repl::ReplSetConfig& oldConfig, long long term) {
                     auto newConfig = oldConfig.getMutable();
                     newConfig.setConfigVersion(newConfig.getConfigVersion() + 1);
@@ -388,22 +389,12 @@ public:
                     return repl::ReplSetConfig(std::move(newConfig));
                 };
 
-                auto status = replCoord->doReplSetReconfig(opCtx, getNewConfig, true /* force */);
+                auto status = replCoord->doReplSetReconfig(opCtx, getNewConfig, false /* force */);
                 uassertStatusOKWithContext(status, "Failed to downgrade the replica set config");
 
-                LOGV2(5042303,
-                      "Waiting for the downgraded replica set config to propagate to a majority");
-                // If a write concern is given, we'll use its wTimeout. It's kNoTimeout by default.
-                WriteConcernOptions writeConcern(
-                    repl::ReplSetConfig::kConfigMajorityWriteConcernModeName,
-                    WriteConcernOptions::SyncMode::NONE,
-                    opCtx->getWriteConcern().wTimeout);
-                writeConcern.checkCondition = WriteConcernOptions::CheckCondition::Config;
-                repl::OpTime fakeOpTime(Timestamp(1, 1), replCoord->getTerm());
                 uassertStatusOKWithContext(
-                    replCoord->awaitReplication(opCtx, fakeOpTime, writeConcern).status,
-                    "Failed to wait for the downgraded replica set config to propagate to a "
-                    "majority");
+                    replCoord->awaitConfigCommitment(opCtx, true /* waitForOplogCommitment */),
+                    "The downgraded replica set config failed to propagate to a majority");
                 LOGV2(5042304,
                       "The downgraded replica set config has been propagated to a majority");
             }
@@ -423,15 +414,7 @@ public:
                 return false;
 
             if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-                // Downgrade shards before config finishes its downgrade.
-                uassertStatusOK(
-                    ShardingCatalogManager::get(opCtx)->setFeatureCompatibilityVersionOnShards(
-                        opCtx, CommandHelpers::appendMajorityWriteConcern(request.toBSON({}))));
-
-                // Amend metadata created in FCV 4.9. This must be done after all shards have
-                // been downgraded to prior 4.9 in order to guarantee that when the metadata is
-                // amended, no new databases or collections with the new version of the metadata
-                // will be added.
+                // Downgrade metadata created in FCV 4.9.
                 // TODO SERVER-53283: Remove once 5.0 has been released.
                 if (requestedVersion < FeatureCompatibilityParams::Version::kVersion49) {
                     try {
@@ -443,6 +426,11 @@ public:
                         throw;
                     }
                 }
+
+                // Downgrade shards after config finishes its downgrade.
+                uassertStatusOK(
+                    ShardingCatalogManager::get(opCtx)->setFeatureCompatibilityVersionOnShards(
+                        opCtx, CommandHelpers::appendMajorityWriteConcern(request.toBSON({}))));
             }
 
             hangWhileDowngrading.pauseWhileSet(opCtx);

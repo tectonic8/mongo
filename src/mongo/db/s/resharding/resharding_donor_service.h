@@ -31,6 +31,8 @@
 
 #include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/s/resharding/donor_document_gen.h"
+#include "mongo/db/s/resharding/resharding_critical_section.h"
+#include "mongo/db/s/resharding_util.h"
 #include "mongo/s/resharding/type_collection_fields_gen.h"
 
 namespace mongo {
@@ -90,9 +92,13 @@ public:
         MongoProcessInterface::CurrentOpConnectionsMode connMode,
         MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept override;
 
-    void onReshardingFieldsChanges(const TypeCollectionReshardingFields& reshardingFields);
+    void onReshardingFieldsChanges(OperationContext* opCtx,
+                                   const TypeCollectionReshardingFields& reshardingFields);
 
     SharedSemiFuture<void> awaitFinalOplogEntriesWritten();
+
+    static void insertStateDocument(OperationContext* opCtx,
+                                    const ReshardingDonorDocument& donorDoc);
 
 private:
     // The following functions correspond to the actions to take at a particular donor state.
@@ -103,10 +109,10 @@ private:
     ExecutorFuture<void> _awaitAllRecipientsDoneCloningThenTransitionToDonatingOplogEntries(
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
 
-    ExecutorFuture<void> _awaitAllRecipientsDoneApplyingThenTransitionToPreparingToMirror(
+    ExecutorFuture<void> _awaitAllRecipientsDoneApplyingThenTransitionToPreparingToBlockWrites(
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
 
-    void _writeTransactionOplogEntryThenTransitionToMirroring();
+    void _writeTransactionOplogEntryThenTransitionToBlockingWrites();
 
     ExecutorFuture<void> _awaitCoordinatorHasDecisionPersistedThenTransitionToDropping(
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
@@ -126,14 +132,15 @@ private:
         boost::optional<Status> abortReason = boost::none,
         boost::optional<ReshardingCloneSize> cloneSizeEstimate = boost::none);
 
-    // Inserts 'doc' on-disk and sets '_donorDoc' in-memory.
-    void _insertDonorDocument(const ReshardingDonorDocument& doc);
-
     // Updates the donor document on-disk and in-memory with the 'replacementDoc.'
     void _updateDonorDocument(ReshardingDonorDocument&& replacementDoc);
 
     // Removes the local donor document from disk and clears the in-memory state.
     void _removeDonorDocument();
+
+    // Does work necessary for both recoverable errors (failover/stepdown) and unrecoverable errors
+    // (abort resharding).
+    void _onAbortOrStepdown(WithLock lk, Status status);
 
     // The in-memory representation of the underlying document in
     // config.localReshardingOperations.donor.
@@ -144,6 +151,8 @@ private:
 
     // Protects the promises below
     Mutex _mutex = MONGO_MAKE_LATCH("ReshardingDonor::_mutex");
+
+    boost::optional<ReshardingCriticalSection> _critSec;
 
     // Each promise below corresponds to a state on the donor state machine. They are listed in
     // ascending order, such that the first promise below will be the first promise fulfilled.

@@ -343,8 +343,13 @@ repl::OpTime getLatestOplogOpTime(OperationContext* opCtx) {
     // Helpers::getLast will bypass the oplog visibility rules by doing a backwards collection
     // scan.
     BSONObj oplogEntryBSON;
-    invariant(
-        Helpers::getLast(opCtx, NamespaceString::kRsOplogNamespace.ns().c_str(), oplogEntryBSON));
+    // This operation does not perform any writes, but the index building code is sensitive to
+    // exceptions and we must protect it from unanticipated write conflicts from reads.
+    writeConflictRetry(
+        opCtx, "getLatestOplogOpTime", NamespaceString::kRsOplogNamespace.ns(), [&]() {
+            invariant(Helpers::getLast(
+                opCtx, NamespaceString::kRsOplogNamespace.ns().c_str(), oplogEntryBSON));
+        });
 
     auto optime = repl::OpTime::parseFromOplogEntry(oplogEntryBSON);
     invariant(optime.isOK(),
@@ -2084,9 +2089,8 @@ void IndexBuildsCoordinator::_runIndexBuildInner(
     // This Status stays unchanged unless we catch an exception in the following try-catch block.
     auto status = Status::OK();
     try {
-        while (MONGO_unlikely(hangAfterInitializingIndexBuild.shouldFail())) {
-            hangAfterInitializingIndexBuild.pauseWhileSet(opCtx);
-        }
+
+        hangAfterInitializingIndexBuild.pauseWhileSet(opCtx);
 
         if (resumeInfo) {
             _resumeIndexBuildFromPhase(opCtx, replState, indexBuildOptions, resumeInfo.get());
@@ -2179,12 +2183,17 @@ void IndexBuildsCoordinator::_resumeIndexBuildFromPhase(
 
     if (resumeInfo.getPhase() == IndexBuildPhaseEnum::kInitialized ||
         resumeInfo.getPhase() == IndexBuildPhaseEnum::kCollectionScan) {
-        _scanCollectionAndInsertSortedKeysIntoIndex(
-            opCtx,
-            replState,
-            resumeInfo.getCollectionScanPosition()
-                ? boost::make_optional<RecordId>(RecordId(*resumeInfo.getCollectionScanPosition()))
-                : boost::none);
+        boost::optional<RecordId> resumeAfterRecordId;
+        if (resumeInfo.getCollectionScanPosition()) {
+            auto scanPosition = *resumeInfo.getCollectionScanPosition();
+            if (auto recordIdOIDPtr = stdx::get_if<OID>(&scanPosition)) {
+                resumeAfterRecordId.emplace(recordIdOIDPtr->view().view(), OID::kOIDSize);
+            } else if (auto recordIdLongPtr = stdx::get_if<int64_t>(&scanPosition)) {
+                resumeAfterRecordId.emplace(RecordId(*recordIdLongPtr));
+            }
+        }
+
+        _scanCollectionAndInsertSortedKeysIntoIndex(opCtx, replState, resumeAfterRecordId);
     } else if (resumeInfo.getPhase() == IndexBuildPhaseEnum::kBulkLoad) {
         _insertSortedKeysIntoIndexForResume(opCtx, replState);
     }

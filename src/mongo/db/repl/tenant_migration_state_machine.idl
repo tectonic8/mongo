@@ -44,6 +44,7 @@ enums:
         type: string
         values:
             kUninitialized: "uninitialized"
+            kAbortingIndexBuilds: "aborting index builds"
             kDataSync: "data sync"
             kBlocking: "blocking"
             kCommitted: "committed"
@@ -122,6 +123,20 @@ structs:
                 type: TenantMigrationPEMPayload
                 # TODO (SERVER-54085): Remove server parameter tenantMigrationDisableX509Auth.
                 optional: true
+            startMigrationDonorTimestamp:
+                type: timestamp
+                optional: true
+                description: >-
+                    Timestamp after all index builds for tenant are complete or aborted.  Recipient
+                    must not start cloning/fetching oplog entries from the donor until this
+                    timestamp is majority committed.
+                validator:
+                    callback: "tenant_migration_util::validateTimestampNotNull"
+            migrationStart:
+                type: date
+                description: >-
+                    The wall-clock time at which the migration has started.
+                optional: true
 
     tenantMigrationRecipientDocument:
         description: "Represents an in-progress tenant migration on the migration recipient."
@@ -143,6 +158,14 @@ structs:
                 description: "The tenantId for the migration."
                 validator:
                     callback: "tenant_migration_util::validateDatabasePrefix"
+            startMigrationDonorTimestamp:
+                type: timestamp
+                description: >-
+                    Timestamp after all index builds for tenant are complete or aborted.  Recipient
+                    must not start cloning/fetching oplog entries from the donor until this
+                    timestamp is majority committed.
+                validator:
+                    callback: "tenant_migration_util::validateTimestampNotNull"
             readPreference:
                 type: readPreference
                 description: >-
@@ -176,6 +199,14 @@ structs:
                     cloning finishes.
                 type: optime
                 optional: true
+            rejectReadsBeforeTimestamp:
+                description: >-
+                    Populated during data sync when the recipientSyncData with the
+                    returnAfterReachingTimestamp is received after data is consistent; the earliest
+                    timestamp at which reads are allowed on the recipient (corresponds to the
+                    donor's blockTimestamp).
+                type: timestamp
+                optional: true
             cloneFinishedRecipientOpTime:
                 description: >-
                     Populated during data sync; the recipient operation time when the data
@@ -196,3 +227,13 @@ structs:
                     downgrade state.
                 type: fcv_string
                 optional: true
+            numRestartsDueToDonorConnectionFailure:
+                description: >-
+                    A counter that is incremented on each restart due to a donor connection failure.
+                type: long
+                default: 0
+            numRestartsDueToRecipientFailure:
+                description: >-
+                    A counter that is incremented on each restart due to a recipient failure.
+                type: long
+                default: 0

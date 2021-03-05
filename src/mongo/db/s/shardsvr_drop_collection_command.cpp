@@ -76,8 +76,6 @@ public:
                     opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
 
             bool useNewPath = [&] {
-                // TODO (SERVER-53092): Use the FCV lock in order to "reserve" operation as running
-                // in new or legacy mode
                 return feature_flags::gShardingFullDDLSupport.isEnabled(
                            serverGlobalParams.featureCompatibility) &&
                     !feature_flags::gDisableIncompleteShardingDDLSupport.isEnabled(

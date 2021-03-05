@@ -31,14 +31,17 @@
 
 #include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/s/resharding/recipient_document_gen.h"
+#include "mongo/db/s/resharding/resharding_critical_section.h"
 #include "mongo/db/s/resharding/resharding_oplog_applier.h"
 #include "mongo/db/s/resharding/resharding_oplog_fetcher.h"
+#include "mongo/db/s/resharding_util.h"
 #include "mongo/s/resharding/type_collection_fields_gen.h"
 #include "mongo/util/concurrency/thread_pool.h"
 
 namespace mongo {
 
 class ReshardingCollectionCloner;
+class ReshardingTxnCloner;
 
 namespace resharding {
 
@@ -54,12 +57,18 @@ void createTemporaryReshardingCollectionLocally(OperationContext* opCtx,
                                                 const UUID& existingUUID,
                                                 Timestamp fetchTimestamp);
 
-std::vector<NamespaceString> ensureStashCollectionsExist(
-    OperationContext* opCtx,
-    const ChunkManager& cm,
-    const UUID& existingUUID,
-    std::vector<DonorShardMirroringEntry> donorShards);
+std::vector<NamespaceString> ensureStashCollectionsExist(OperationContext* opCtx,
+                                                         const ChunkManager& cm,
+                                                         const UUID& existingUUID,
+                                                         std::vector<ShardId> donorShards);
 
+ReshardingDonorOplogId getFetcherIdToResumeFrom(OperationContext* opCtx,
+                                                NamespaceString oplogBufferNss,
+                                                Timestamp fetchTimestamp);
+
+ReshardingDonorOplogId getApplierIdToResumeFrom(OperationContext* opCtx,
+                                                ReshardingSourceId sourceId,
+                                                Timestamp fetchTimestamp);
 }  // namespace resharding
 
 class ReshardingRecipientService final : public repl::PrimaryOnlyService {
@@ -117,11 +126,16 @@ public:
         MongoProcessInterface::CurrentOpConnectionsMode,
         MongoProcessInterface::CurrentOpSessionsMode) noexcept override;
 
-    void onReshardingFieldsChanges(const TypeCollectionReshardingFields& reshardingFields);
+    void onReshardingFieldsChanges(OperationContext* opCtx,
+                                   const TypeCollectionReshardingFields& reshardingFields);
+
+    static void insertStateDocument(OperationContext* opCtx,
+                                    const ReshardingRecipientDocument& recipientDoc);
 
 private:
     // The following functions correspond to the actions to take at a particular recipient state.
-    void _transitionToCreatingTemporaryReshardingCollection();
+    ExecutorFuture<void> _awaitAllDonorsPreparedToDonateThenTransitionToCreatingCollection(
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
 
     void _createTemporaryReshardingCollectionThenTransitionToCloning();
 
@@ -131,32 +145,40 @@ private:
 
     void _applyThenTransitionToSteadyState();
 
-    ExecutorFuture<void> _awaitAllDonorsMirroringThenTransitionToStrictConsistency(
+    ExecutorFuture<void> _awaitAllDonorsBlockingWritesThenTransitionToStrictConsistency(
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
 
-    ExecutorFuture<void> __awaitCoordinatorHasDecisionPersistedThenTransitionToRenaming(
+    ExecutorFuture<void> _awaitCoordinatorHasDecisionPersistedThenTransitionToRenaming(
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
 
     void _renameTemporaryReshardingCollection();
-
-    void _fulfillAllDonorsPreparedToDonate(Timestamp);
 
     // Transitions the state on-disk and in-memory to 'endState'.
     void _transitionState(RecipientStateEnum endState,
                           boost::optional<Timestamp> fetchTimestamp = boost::none,
                           boost::optional<Status> abortReason = boost::none);
 
-    void _transitionStateAndUpdateCoordinator(RecipientStateEnum endState,
-                                              boost::optional<Status> abortReason = boost::none);
-
-    // Inserts 'doc' on-disk and sets '_replacementDoc' in-memory.
-    void _insertRecipientDocument(const ReshardingRecipientDocument& doc);
+    void _updateCoordinator();
 
     // Updates the recipient document on-disk and in-memory with the 'replacementDoc.'
     void _updateRecipientDocument(ReshardingRecipientDocument&& replacementDoc);
 
     // Removes the local recipient document from disk and clears the in-memory state.
     void _removeRecipientDocument();
+
+    // Removes any docs from the oplog applier progress and txn applier progress collections that
+    // are associated with the in-progress operation. Also drops all oplog buffer collections and
+    // all conflict stash collections that are associated with the in-progress operation.
+    void _dropOplogCollections(OperationContext* opCtx);
+
+    // Initializes the txn cloners for this resharding operation.
+    void _initTxnCloner(OperationContext* opCtx, const Timestamp& fetchTimestamp);
+
+    ReshardingMetrics* _metrics() const;
+
+    // Does work necessary for both recoverable errors (failover/stepdown) and unrecoverable errors
+    // (abort resharding).
+    void _onAbortOrStepdown(WithLock, Status status);
 
     // The in-memory representation of the underlying document in
     // config.localReshardingOperations.recipient.
@@ -166,6 +188,7 @@ private:
     const UUID _id;
 
     std::unique_ptr<ReshardingCollectionCloner> _collectionCloner;
+    std::vector<std::unique_ptr<ReshardingTxnCloner>> _txnCloners;
 
     std::vector<std::unique_ptr<ReshardingOplogApplier>> _oplogAppliers;
     std::vector<std::unique_ptr<ThreadPool>> _oplogApplierWorkers;
@@ -179,8 +202,12 @@ private:
     // Protects the promises below
     Mutex _mutex = MONGO_MAKE_LATCH("ReshardingRecipient::_mutex");
 
+    boost::optional<ReshardingCriticalSection> _critSec;
+
     // Each promise below corresponds to a state on the recipient state machine. They are listed in
     // ascending order, such that the first promise below will be the first promise fulfilled.
+    SharedPromise<Timestamp> _allDonorsPreparedToDonate;
+
     SharedPromise<void> _coordinatorHasDecisionPersisted;
 
     SharedPromise<void> _completionPromise;

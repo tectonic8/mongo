@@ -87,10 +87,20 @@ StatusWith<BSONObj> validateIndexSpecCollation(OperationContext* opCtx,
                                                const CollatorInterface* defaultCollator);
 
 /**
+ * Validates the the 'expireAfterSeconds' value for a TTL index..
+ */
+Status validateExpireAfterSeconds(std::int64_t expireAfterSeconds);
+
+/**
  * Validates the key pattern and the 'expireAfterSeconds' duration in the index specification
  * 'indexSpec' for a TTL index. Returns success if 'indexSpec' does not refer to a TTL index.
  */
 Status validateIndexSpecTTL(const BSONObj& indexSpec);
+
+/**
+ * Returns whether an index is allowed in API version 1.
+ */
+bool isIndexAllowedInAPIVersion1(const IndexDescriptor& indexDesc);
 
 /**
  * Optional filtering function to adjust allowed index field names at startup.

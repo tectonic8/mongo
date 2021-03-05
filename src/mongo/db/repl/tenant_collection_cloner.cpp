@@ -59,6 +59,10 @@ const int kProgressMeterCheckInterval = 128;
 // listIndexes and recorded the results and the operationTime.
 MONGO_FAIL_POINT_DEFINE(tenantCollectionClonerHangAfterGettingOperationTime);
 
+// Failpoint which causes the tenant collection cloner to hang after createCollection. This
+// failpoint doesn't check for cloner exit so we can rely on its timesEntered in tests.
+MONGO_FAIL_POINT_DEFINE(tenantCollectionClonerHangAfterCreateCollection);
+
 // Failpoint which causes tenant migration to hang after handling the next batch of results from the
 // DBClientConnection, optionally limited to a specific collection.
 MONGO_FAIL_POINT_DEFINE(tenantMigrationHangCollectionClonerAfterHandlingBatchResponse);
@@ -78,6 +82,10 @@ TenantCollectionCloner::TenantCollectionCloner(const NamespaceString& sourceNss,
       _sourceDbAndUuid(NamespaceString("UNINITIALIZED")),
       _collectionClonerBatchSize(collectionClonerBatchSize),
       _countStage("count", this, &TenantCollectionCloner::countStage),
+      _checkIfDonorCollectionIsEmptyStage(
+          "checkIfDonorCollectionIsEmpty",
+          this,
+          &TenantCollectionCloner::checkIfDonorCollectionIsEmptyStage),
       _listIndexesStage("listIndexes", this, &TenantCollectionCloner::listIndexesStage),
       _createCollectionStage(
           "createCollection", this, &TenantCollectionCloner::createCollectionStage),
@@ -111,7 +119,11 @@ TenantCollectionCloner::TenantCollectionCloner(const NamespaceString& sourceNss,
 }
 
 BaseCloner::ClonerStages TenantCollectionCloner::getStages() {
-    return {&_countStage, &_listIndexesStage, &_createCollectionStage, &_queryStage};
+    return {&_countStage,
+            &_checkIfDonorCollectionIsEmptyStage,
+            &_listIndexesStage,
+            &_createCollectionStage,
+            &_queryStage};
 }
 
 void TenantCollectionCloner::preStage() {
@@ -168,6 +180,34 @@ BaseCloner::AfterStageBehavior TenantCollectionCloner::countStage() {
         stdx::lock_guard<Latch> lk(_mutex);
         _stats.documentToCopy = count;
     }
+    return kContinueNormally;
+}
+
+// This avoids a race where an index may be created and data inserted after we do listIndexes.
+// That would result in doing a createIndexes on a non-empty collection during oplog application.
+// Instead, if the collection is empty before listIndexes, we do not clone the data -- it will be
+// added during oplog application.
+//
+// Note we cannot simply use the count() above, because that checks metadata which may not be 100%
+// accurate.
+BaseCloner::AfterStageBehavior TenantCollectionCloner::checkIfDonorCollectionIsEmptyStage() {
+    auto fieldsToReturn = BSON("_id" << 1);
+    auto cursor =
+        getClient()->query(_sourceDbAndUuid,
+                           {} /* Query */,
+                           1 /* limit */,
+                           0 /* skip */,
+                           &fieldsToReturn,
+                           QueryOption_SecondaryOk,
+                           0 /* batchSize */,
+                           ReadConcernArgs(ReadConcernLevel::kMajorityReadConcern).toBSONInner());
+    _donorCollectionWasEmptyBeforeListIndexes = !cursor->more();
+    LOGV2_DEBUG(5368500,
+                1,
+                "Checked if donor collection was empty",
+                "wasEmpty"_attr = _donorCollectionWasEmptyBeforeListIndexes,
+                "namespace"_attr = _sourceNss.ns(),
+                "tenantId"_attr = _tenantId);
     return kContinueNormally;
 }
 
@@ -332,10 +372,19 @@ BaseCloner::AfterStageBehavior TenantCollectionCloner::createCollectionStage() {
         uassertStatusOKWithContext(status, "Tenant collection cloner: create indexes");
     }
 
+    tenantCollectionClonerHangAfterCreateCollection.pauseWhileSet();
     return kContinueNormally;
 }
 
 BaseCloner::AfterStageBehavior TenantCollectionCloner::queryStage() {
+    if (_donorCollectionWasEmptyBeforeListIndexes) {
+        LOGV2_WARNING(5368501,
+                      "Collection was empty at clone time.",
+                      "namespace"_attr = _sourceNss,
+                      "tenantId"_attr = _tenantId);
+        return kContinueNormally;
+    }
+
     // Sets up tracking the lastVisibleOpTime from response metadata.
     auto requestMetadataWriter = [this](OperationContext* opCtx,
                                         BSONObjBuilder* metadataBob) -> Status {

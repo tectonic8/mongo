@@ -29,12 +29,18 @@
 
 #pragma once
 
+#include <queue>
+
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_set_window_fields.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/window_function/partition_iterator.h"
 #include "mongo/db/pipeline/window_function/window_bounds.h"
+#include "mongo/db/pipeline/window_function/window_function.h"
 
 namespace mongo {
+
+struct WindowFunctionStatement;
 
 /**
  * An interface for an executor class capable of evaluating a function over a given window
@@ -46,7 +52,14 @@ namespace mongo {
  */
 class WindowFunctionExec {
 public:
-    WindowFunctionExec(PartitionIterator* iter) : _iter(iter){};
+    /**
+     * Creates an appropriate WindowFunctionExec that is capable of evaluating the window function
+     * over the given bounds, both found within the WindowFunctionStatement.
+     */
+    static std::unique_ptr<WindowFunctionExec> create(PartitionIterator* iter,
+                                                      const WindowFunctionStatement& functionStmt);
+
+    virtual ~WindowFunctionExec() = default;
 
     /**
      * Retrieve the next value computed by the window function.
@@ -59,7 +72,53 @@ public:
     virtual void reset() = 0;
 
 protected:
+    WindowFunctionExec(PartitionIterator* iter) : _iter(iter){};
+
     PartitionIterator* _iter;
+};
+
+/**
+ * Base class for executors that need to remove documents from their held functions. The
+ * 'WindowFunctionState' parameter must expose an 'add()' and corresponding
+ * 'getValue()' method to get the accumulation result. It must also expose a 'remove()' method to
+ * remove a specific document from the calculation.
+ */
+class WindowFunctionExecRemovable : public WindowFunctionExec {
+public:
+    WindowFunctionExecRemovable(PartitionIterator* iter,
+                                boost::intrusive_ptr<Expression> input,
+                                std::unique_ptr<WindowFunctionState> function)
+        : WindowFunctionExec(iter), _input(std::move(input)), _function(std::move(function)) {}
+
+    Value getNext() {
+        if (!_initialized) {
+            this->initialize();
+            _initialized = true;
+            return _function->getValue();
+        }
+        processDocumentsToUpperBound();
+        removeDocumentsUnderLowerBound();
+        return _function->getValue();
+    }
+
+protected:
+    boost::intrusive_ptr<Expression> _input;
+    std::unique_ptr<WindowFunctionState> _function;
+    // Keep track of values in the window function that will need to be removed later.
+    std::queue<Value> _values;
+    // In one of two states: either the initial window has not been populated or we are sliding and
+    // accumulating/removing values.
+    bool _initialized = false;
+
+    void addValue(Value v) {
+        _function->add(v);
+        _values.push(v);
+    }
+
+private:
+    virtual void processDocumentsToUpperBound() = 0;
+    virtual void removeDocumentsUnderLowerBound() = 0;
+    virtual void initialize() = 0;
 };
 
 }  // namespace mongo

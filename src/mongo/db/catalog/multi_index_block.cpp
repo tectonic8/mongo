@@ -51,7 +51,6 @@
 #include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/repl/tenant_migration_committed_info.h"
 #include "mongo/db/repl/tenant_migration_conflict_info.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/write_unit_of_work.h"
@@ -307,7 +306,7 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(
             if (!resumeInfo) {
                 // TODO SERVER-14888 Suppress this in cases we don't want to audit.
                 audit::logCreateIndex(
-                    opCtx->getClient(), &info, descriptor->indexName(), collection->ns().ns());
+                    opCtx->getClient(), &info, descriptor->indexName(), collection->ns());
             }
         }
 
@@ -897,8 +896,15 @@ BSONObj MultiIndexBlock::_constructStateObject(OperationContext* opCtx,
 
     // We can be interrupted by shutdown before inserting the first document from the collection
     // scan, in which case there is no _lastRecordIdInserted.
-    if (_phase == IndexBuildPhaseEnum::kCollectionScan && _lastRecordIdInserted)
-        builder.append("collectionScanPosition", _lastRecordIdInserted->asLong());
+    if (_phase == IndexBuildPhaseEnum::kCollectionScan && _lastRecordIdInserted) {
+        _lastRecordIdInserted->withFormat(
+            [](RecordId::Null n) { invariant(false); },
+            [&](int64_t rid) { builder.append("collectionScanPosition", rid); },
+            [&](const char* str, int size) {
+                OID oid = OID::from(str);
+                builder.appendOID("collectionScanPosition", &oid);
+            });
+    }
 
     BSONArrayBuilder indexesArray(builder.subarrayStart("indexes"));
     for (const auto& index : _indexes) {

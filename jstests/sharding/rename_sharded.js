@@ -25,8 +25,11 @@ function testRename(st, dbName, toNs, dropTarget, mustFail) {
 
     const fromUUID = getUUIDFromConfigCollections(mongos, fromNs);
     const aChunk = mongos.getDB('config').chunks.findOne({uuid: fromUUID});
-    assert.commandWorked(mongos.adminCommand(
-        {moveChunk: fromNs, bounds: [aChunk.min, aChunk.max], to: st.shard1.shardName}));
+    assert.commandWorked(mongos.adminCommand({
+        moveChunk: fromNs,
+        bounds: [aChunk.min, aChunk.max],
+        to: st.shard1.shardName,
+    }));
 
     const res = fromColl.renameCollection(toNs.split('.')[1], dropTarget);
     if (mustFail) {
@@ -49,7 +52,11 @@ function testRename(st, dbName, toNs, dropTarget, mustFail) {
     assert.eq(toColl.find({x: 2}).itcount(), 1, 'Expected exactly one document on the shard');
 }
 
-const st = new ShardingTest({shards: 2, mongos: 1, other: {enableBalancer: false}});
+// Never use the third shard, but leave it in order to indirectly check that rename participants
+// properly handle the following cases:
+// - Locally unknown source collection to rename
+// - Locally unknown target collection to drop
+const st = new ShardingTest({shards: 3, mongos: 1, other: {enableBalancer: false}});
 
 // Test just if DDL feature flag enabled
 const DDLFeatureFlagParam = assert.commandWorked(
@@ -80,8 +87,11 @@ if (isDDLFeatureFlagEnabled) {
 
         const toUUID = getUUIDFromConfigCollections(mongos, toNs);
         const aChunk = mongos.getDB('config').chunks.findOne({uuid: toUUID});
-        assert.commandWorked(mongos.adminCommand(
-            {moveChunk: toNs, bounds: [aChunk.min, aChunk.max], to: st.shard1.shardName}));
+        assert.commandWorked(mongos.adminCommand({
+            moveChunk: toNs,
+            bounds: [aChunk.min, aChunk.max],
+            to: st.shard1.shardName,
+        }));
 
         testRename(st, dbName, toNs, true /* dropTarget */, false /* mustFail */);
     }
@@ -121,6 +131,35 @@ if (isDDLFeatureFlagEnabled) {
         toColl.insert({a: 0});
 
         testRename(st, dbName, toNs, false /* dropTarget */, true /* mustFail */);
+    }
+
+    // Rename unsharded collection to sharded target collection with dropTarget=true must succeed
+    {
+        const dbName = 'testRenameUnshardedToShardedTargetCollection';
+        const fromNs = dbName + '.from';
+        const toNs = dbName + '.to';
+        assert.commandWorked(
+            mongos.adminCommand({enablesharding: dbName, primaryShard: st.shard0.shardName}));
+        assert.commandWorked(mongos.adminCommand({shardCollection: toNs, key: {a: 1}}));
+
+        const toColl = mongos.getCollection(toNs);
+        toColl.insert({a: 0});
+        toColl.insert({a: 2});
+        assert.commandWorked(mongos.adminCommand({split: toNs, middle: {a: 1}}));
+        const toUUID = getUUIDFromConfigCollections(mongos, toNs);
+        const aChunk = mongos.getDB('config').chunks.findOne({uuid: toUUID});
+        assert.commandWorked(mongos.adminCommand(
+            {moveChunk: toNs, bounds: [aChunk.min, aChunk.max], to: st.shard1.shardName}));
+
+        const fromColl = mongos.getCollection(fromNs);
+        fromColl.insert({x: 0});
+
+        assert.commandWorked(fromColl.renameCollection(toNs.split('.')[1], true /* dropTarget */));
+
+        // Source collection just has documents with field `x`
+        assert.eq(toColl.find({x: {$exists: true}}).itcount(), 1, 'Expected one source document');
+        // Source collection just has documents with field `a`
+        assert.eq(toColl.find({a: {$exists: true}}).itcount(), 0, 'Expected no target documents');
     }
 
     // Successful rename must pass tags from source to the target collection

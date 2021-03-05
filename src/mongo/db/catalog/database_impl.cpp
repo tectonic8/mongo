@@ -282,7 +282,11 @@ void DatabaseImpl::getStats(OperationContext* opCtx, BSONObjBuilder* output, dou
             return true;
         });
 
-    ViewCatalog::get(this)->iterate(opCtx, [&](const ViewDefinition& view) { nViews += 1; });
+
+    ViewCatalog::get(this)->iterate([&](const ViewDefinition& view) {
+        nViews += 1;
+        return true;
+    });
 
     output->appendNumber("collections", nCollections);
     output->appendNumber("views", nViews);
@@ -349,7 +353,6 @@ Status DatabaseImpl::dropCollection(OperationContext* opCtx,
         } else if (!(nss.isSystemDotViews() || nss.isHealthlog() ||
                      nss == NamespaceString::kLogicalSessionsNamespace ||
                      nss == NamespaceString::kKeysCollectionNamespace ||
-                     nss == NamespaceString::kExternalKeysCollectionNamespace ||
                      nss.isTemporaryReshardingCollection())) {
             return Status(ErrorCodes::IllegalOperation,
                           str::stream() << "can't drop system collection " << nss);
@@ -391,7 +394,7 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
                           << numIndexesInProgress << " index builds in progress.",
             numIndexesInProgress == 0);
 
-    audit::logDropCollection(&cc(), nss.toString());
+    audit::logDropCollection(&cc(), nss);
 
     auto serviceContext = opCtx->getServiceContext();
     Top::get(serviceContext).collectionDropped(nss);
@@ -624,7 +627,7 @@ Status DatabaseImpl::createView(OperationContext* opCtx,
             opCtx, this, viewName, viewOnNss, pipeline, options.collation, options.timeseries);
     }
 
-    audit::logCreateView(&cc(), viewName.toString(), viewOnNss.toString(), pipeline, status.code());
+    audit::logCreateView(&cc(), viewName, viewOnNss.toString(), pipeline, status.code());
     return status;
 }
 
@@ -690,7 +693,7 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
 
     _checkCanCreateCollection(opCtx, nss, optionsWithUUID);
     assertMovePrimaryInProgress(opCtx, nss);
-    audit::logCreateCollection(&cc(), nss.ns());
+    audit::logCreateCollection(&cc(), nss);
 
     LOGV2(20320,
           "createCollection: {namespace} with {generatedUUID_generated_provided} UUID: "

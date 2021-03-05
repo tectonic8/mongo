@@ -31,7 +31,6 @@
 
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/operation_sharding_state.h"
@@ -188,17 +187,14 @@ protected:
             metadata.getShardKeyPattern().toBSON(),
             recipientDoc);
 
-        ASSERT(recipientDoc.getState() == RecipientStateEnum::kCreatingCollection);
-        ASSERT(recipientDoc.getFetchTimestamp() ==
-               reshardingFields.getRecipientFields()->getFetchTimestamp());
+        ASSERT(recipientDoc.getState() == RecipientStateEnum::kAwaitingFetchTimestamp);
+        ASSERT(!recipientDoc.getFetchTimestamp());
 
         auto donorShardIds = reshardingFields.getRecipientFields()->getDonorShardIds();
         auto donorShardIdsSet = std::set<ShardId>(donorShardIds.begin(), donorShardIds.end());
 
-        for (const auto& donorShardMirroringEntry : recipientDoc.getDonorShardsMirroring()) {
-            ASSERT_EQ(donorShardMirroringEntry.getMirroring(), false);
-            auto reshardingFieldsDonorShardId =
-                donorShardIdsSet.find(donorShardMirroringEntry.getId());
+        for (const auto& donorShardId : recipientDoc.getDonorShards()) {
+            auto reshardingFieldsDonorShardId = donorShardIdsSet.find(donorShardId);
             ASSERT(reshardingFieldsDonorShardId != donorShardIdsSet.end());
             donorShardIdsSet.erase(reshardingFieldsDonorShardId);
         }

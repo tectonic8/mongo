@@ -53,9 +53,14 @@
 
 namespace mongo {
 
+MONGO_FAIL_POINT_DEFINE(reshardingDonorFailsBeforePreparingToMirror);
+
 using namespace fmt::literals;
 
 namespace {
+
+const WriteConcernOptions kNoWaitWriteConcern{1, WriteConcernOptions::SyncMode::UNSET, Seconds(0)};
+
 ChunkManager getShardedCollectionRoutingInfoWithRefreshAndFlush(const NamespaceString& nss) {
     auto opCtx = cc().makeOperationContext();
 
@@ -159,9 +164,9 @@ SemiFuture<void> ReshardingDonorService::DonorStateMachine::run(
             return _awaitAllRecipientsDoneCloningThenTransitionToDonatingOplogEntries(executor);
         })
         .then([this, executor] {
-            return _awaitAllRecipientsDoneApplyingThenTransitionToPreparingToMirror(executor);
+            return _awaitAllRecipientsDoneApplyingThenTransitionToPreparingToBlockWrites(executor);
         })
-        .then([this] { _writeTransactionOplogEntryThenTransitionToMirroring(); })
+        .then([this] { _writeTransactionOplogEntryThenTransitionToBlockingWrites(); })
         .then([this, executor] {
             return _awaitCoordinatorHasDecisionPersistedThenTransitionToDropping(executor);
         })
@@ -173,13 +178,20 @@ SemiFuture<void> ReshardingDonorService::DonorStateMachine::run(
                   "reshardingId"_attr = _id,
                   "error"_attr = status);
             _transitionStateAndUpdateCoordinator(DonorStateEnum::kError, boost::none, status);
+
+            // TODO SERVER-52838: Ensure all local collections that may have been created for
+            // resharding are removed, with the exception of the ReshardingDonorDocument, before
+            // transitioning to kDone.
+            _transitionStateAndUpdateCoordinator(DonorStateEnum::kDone, boost::none, status);
             return status;
         })
         .onCompletion([this, self = shared_from_this()](Status status) {
-            stdx::lock_guard<Latch> lg(_mutex);
-            if (_completionPromise.getFuture().isReady()) {
-                // interrupt() was called before we got here.
-                return;
+            {
+                stdx::lock_guard<Latch> lg(_mutex);
+                if (_completionPromise.getFuture().isReady()) {
+                    // interrupt() was called before we got here.
+                    return;
+                }
             }
 
             if (status.isOK()) {
@@ -188,9 +200,15 @@ SemiFuture<void> ReshardingDonorService::DonorStateMachine::run(
                 // the instance is deleted. It is necessary to use shared_from_this() to extend the
                 // lifetime so the code can safely finish executing.
                 _removeDonorDocument();
-                _completionPromise.emplaceValue();
+                stdx::lock_guard<Latch> lg(_mutex);
+                if (!_completionPromise.getFuture().isReady()) {
+                    _completionPromise.emplaceValue();
+                }
             } else {
-                _completionPromise.setError(status);
+                stdx::lock_guard<Latch> lg(_mutex);
+                if (!_completionPromise.getFuture().isReady()) {
+                    _completionPromise.setError(status);
+                }
             }
         })
         .semi();
@@ -198,23 +216,8 @@ SemiFuture<void> ReshardingDonorService::DonorStateMachine::run(
 
 void ReshardingDonorService::DonorStateMachine::interrupt(Status status) {
     // Resolve any unresolved promises to avoid hanging.
-    stdx::lock_guard<Latch> lg(_mutex);
-    if (!_allRecipientsDoneCloning.getFuture().isReady()) {
-        _allRecipientsDoneCloning.setError(status);
-    }
-
-    if (!_allRecipientsDoneApplying.getFuture().isReady()) {
-        _allRecipientsDoneApplying.setError(status);
-    }
-
-    if (!_finalOplogEntriesWritten.getFuture().isReady()) {
-        _finalOplogEntriesWritten.setError(status);
-    }
-
-    if (!_coordinatorHasDecisionPersisted.getFuture().isReady()) {
-        _coordinatorHasDecisionPersisted.setError(status);
-    }
-
+    stdx::lock_guard<Latch> lk(_mutex);
+    _onAbortOrStepdown(lk, status);
     if (!_completionPromise.getFuture().isReady()) {
         _completionPromise.setError(status);
     }
@@ -232,28 +235,31 @@ boost::optional<BSONObj> ReshardingDonorService::DonorStateMachine::reportForCur
 }
 
 void ReshardingDonorService::DonorStateMachine::onReshardingFieldsChanges(
-    const TypeCollectionReshardingFields& reshardingFields) {
-    auto coordinatorState = reshardingFields.getState();
-    if (coordinatorState == CoordinatorStateEnum::kError) {
-        // TODO SERVER-52838: Investigate if we want to have a special error code so the donor knows
-        // when it has recieved the error from the coordinator rather than needing to report an
-        // error to the coordinator.
-        interrupt({ErrorCodes::InternalError,
-                   "ReshardingDonorService observed CoordinatorStateEnum::kError"});
+    OperationContext* opCtx, const TypeCollectionReshardingFields& reshardingFields) {
+    stdx::lock_guard<Latch> lk(_mutex);
+    if (reshardingFields.getAbortReason()) {
+        auto status = getStatusFromAbortReason(reshardingFields);
+        _onAbortOrStepdown(lk, status);
         return;
     }
 
-    stdx::lock_guard<Latch> lk(_mutex);
+    auto coordinatorState = reshardingFields.getState();
     if (coordinatorState >= CoordinatorStateEnum::kApplying) {
         ensureFulfilledPromise(lk, _allRecipientsDoneCloning);
     }
 
-    if (coordinatorState >= CoordinatorStateEnum::kMirroring) {
+    if (coordinatorState >= CoordinatorStateEnum::kBlockingWrites) {
+        _critSec.emplace(opCtx->getServiceContext(), _donorDoc.getNss());
+
         ensureFulfilledPromise(lk, _allRecipientsDoneApplying);
     }
 
     if (coordinatorState >= CoordinatorStateEnum::kDecisionPersisted) {
         ensureFulfilledPromise(lk, _coordinatorHasDecisionPersisted);
+    }
+
+    if (coordinatorState >= CoordinatorStateEnum::kDone) {
+        _critSec.reset();
     }
 }
 
@@ -263,8 +269,6 @@ void ReshardingDonorService::DonorStateMachine::
         invariant(_donorDoc.getMinFetchTimestamp());
         return;
     }
-
-    _insertDonorDocument(_donorDoc);
 
     ReshardingCloneSize cloneSizeEstimate;
     {
@@ -316,26 +320,31 @@ ExecutorFuture<void> ReshardingDonorService::DonorStateMachine::
         return ExecutorFuture<void>(**executor, Status::OK());
     }
 
-    return _allRecipientsDoneCloning.getFuture().thenRunOn(**executor).then([this]() {
-        _transitionState(DonorStateEnum::kDonatingOplogEntries);
-    });
+    return _allRecipientsDoneCloning.getFuture()
+        .thenRunOn(**executor)
+        .then([this]() { _transitionState(DonorStateEnum::kDonatingOplogEntries); })
+        .onCompletion([=](Status s) {
+            if (MONGO_unlikely(reshardingDonorFailsBeforePreparingToMirror.shouldFail())) {
+                uasserted(ErrorCodes::InternalError, "Failing for test");
+            }
+        });
 }
 
 ExecutorFuture<void> ReshardingDonorService::DonorStateMachine::
-    _awaitAllRecipientsDoneApplyingThenTransitionToPreparingToMirror(
+    _awaitAllRecipientsDoneApplyingThenTransitionToPreparingToBlockWrites(
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor) {
     if (_donorDoc.getState() > DonorStateEnum::kDonatingOplogEntries) {
         return ExecutorFuture<void>(**executor, Status::OK());
     }
 
     return _allRecipientsDoneApplying.getFuture().thenRunOn(**executor).then([this]() {
-        _transitionState(DonorStateEnum::kPreparingToMirror);
+        _transitionState(DonorStateEnum::kPreparingToBlockWrites);
     });
 }
 
 void ReshardingDonorService::DonorStateMachine::
-    _writeTransactionOplogEntryThenTransitionToMirroring() {
-    if (_donorDoc.getState() > DonorStateEnum::kPreparingToMirror) {
+    _writeTransactionOplogEntryThenTransitionToBlockingWrites() {
+    if (_donorDoc.getState() > DonorStateEnum::kPreparingToBlockWrites) {
         return;
     }
 
@@ -410,7 +419,7 @@ void ReshardingDonorService::DonorStateMachine::
         }
     }
 
-    _transitionState(DonorStateEnum::kMirroring);
+    _transitionState(DonorStateEnum::kBlockingWrites);
 }
 
 SharedSemiFuture<void> ReshardingDonorService::DonorStateMachine::awaitFinalOplogEntriesWritten() {
@@ -420,7 +429,7 @@ SharedSemiFuture<void> ReshardingDonorService::DonorStateMachine::awaitFinalOplo
 ExecutorFuture<void> ReshardingDonorService::DonorStateMachine::
     _awaitCoordinatorHasDecisionPersistedThenTransitionToDropping(
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor) {
-    if (_donorDoc.getState() > DonorStateEnum::kMirroring) {
+    if (_donorDoc.getState() > DonorStateEnum::kBlockingWrites) {
         return ExecutorFuture<void>(**executor, Status::OK());
     }
 
@@ -453,13 +462,16 @@ void ReshardingDonorService::DonorStateMachine::_transitionState(
     emplaceMinFetchTimestampIfExists(replacementDoc, minFetchTimestamp);
     emplaceAbortReasonIfExists(replacementDoc, abortReason);
 
+    // For logging purposes.
+    auto oldState = _donorDoc.getState();
     auto newState = replacementDoc.getState();
+
     _updateDonorDocument(std::move(replacementDoc));
 
     LOGV2_INFO(5279505,
                "Transitioned resharding donor state",
                "newState"_attr = DonorState_serializer(newState),
-               "oldState"_attr = DonorState_serializer(_donorDoc.getState()),
+               "oldState"_attr = DonorState_serializer(oldState),
                "ns"_attr = _donorDoc.getNss(),
                "collectionUUID"_attr = _donorDoc.getExistingUUID(),
                "reshardingUUID"_attr = _donorDoc.get_id());
@@ -503,14 +515,11 @@ void ReshardingDonorService::DonorStateMachine::_transitionStateAndUpdateCoordin
                                    ShardingCatalogClient::kMajorityWriteConcern));
 }
 
-void ReshardingDonorService::DonorStateMachine::_insertDonorDocument(
-    const ReshardingDonorDocument& doc) {
-    auto opCtx = cc().makeOperationContext();
+void ReshardingDonorService::DonorStateMachine::insertStateDocument(
+    OperationContext* opCtx, const ReshardingDonorDocument& donorDoc) {
     PersistentTaskStore<ReshardingDonorDocument> store(
         NamespaceString::kDonorReshardingOperationsNamespace);
-    store.add(opCtx.get(), doc, WriteConcerns::kMajorityWriteConcern);
-
-    _donorDoc = doc;
+    store.add(opCtx, donorDoc, kNoWaitWriteConcern);
 }
 
 void ReshardingDonorService::DonorStateMachine::_updateDonorDocument(
@@ -534,6 +543,24 @@ void ReshardingDonorService::DonorStateMachine::_removeDonorDocument() {
                  BSON(ReshardingDonorDocument::k_idFieldName << _id),
                  WriteConcerns::kMajorityWriteConcern);
     _donorDoc = {};
+}
+
+void ReshardingDonorService::DonorStateMachine::_onAbortOrStepdown(WithLock, Status status) {
+    if (!_allRecipientsDoneCloning.getFuture().isReady()) {
+        _allRecipientsDoneCloning.setError(status);
+    }
+
+    if (!_allRecipientsDoneApplying.getFuture().isReady()) {
+        _allRecipientsDoneApplying.setError(status);
+    }
+
+    if (!_finalOplogEntriesWritten.getFuture().isReady()) {
+        _finalOplogEntriesWritten.setError(status);
+    }
+
+    if (!_coordinatorHasDecisionPersisted.getFuture().isReady()) {
+        _coordinatorHasDecisionPersisted.setError(status);
+    }
 }
 
 }  // namespace mongo

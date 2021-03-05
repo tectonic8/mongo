@@ -382,15 +382,16 @@ server_parameters:
         default:
             expr: 15 * 60 * 1000
 
-    tenantMigrationExternalKeysRemovalDelaySecs:
+    tenantMigrationExternalKeysRemovalBufferSecs:
         description: >-
             The amount of time in seconds that the donor or recipient should wait before
-            removing the cluster time keys cloned from each other.
+            removing the cluster time keys cloned from each other after receiving
+            donorForgetMigration or recipientForgetMigration
         set_at: [ startup, runtime ]
         cpp_vartype: AtomicWord<int>
-        cpp_varname: tenantMigrationExternalKeysRemovalDelaySecs
+        cpp_varname: tenantMigrationExternalKeysRemovalBufferSecs
         default:
-            expr: 3 * 30 * 24 * 60 * 60   # ~3 months
+            expr: 60 * 60 * 24   # 24 hours
 
     tenantMigrationOplogBufferPeekCacheSize:
         description: >-
@@ -419,7 +420,10 @@ server_parameters:
         set_at: startup
         cpp_vartype: int
         cpp_varname: maxTenantMigrationRecipientThreadPoolSize
-        default: 8
+        # Each migration needs at least 2 dedicated threads for oplog fetching and data cloning plus
+        # 1 thread for other async jobs. To support 50 concurrent migrations on the recipient, we
+        # set the thread pool size to 128.
+        default: 128
         validator:
             gte: 1
 
@@ -470,8 +474,10 @@ feature_flags:
         cpp_varname: feature_flags::gTenantMigrations
         default: false
 
+    # TODO (SERVER-54730): Remove featureFlagUseSecondaryDelaySecs.
     featureFlagUseSecondaryDelaySecs:
         description: >-
             If enabled, use field secondaryDelaySecs instead of slaveDelay in MemberConfig.
         cpp_varname: feature_flags::gUseSecondaryDelaySecs
-        default: false
+        default: true
+        version: 4.9

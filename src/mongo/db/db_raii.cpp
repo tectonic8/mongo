@@ -60,9 +60,33 @@ bool supportsLockFreeRead(OperationContext* opCtx) {
     // Lock-free reads are not supported in multi-document transactions.
     // Lock-free reads are not supported under an exclusive lock (nested reads under exclusive lock
     // holding operations).
+    // Lock-free reads are not supported if a storage txn is already open w/o the lock-free reads
+    // operation flag set.
     return !storageGlobalParams.disableLockFreeReads && !opCtx->inMultiDocumentTransaction() &&
-        !opCtx->lockState()->isWriteLocked();
+        !opCtx->lockState()->isWriteLocked() &&
+        !(opCtx->recoveryUnit()->isActive() && !opCtx->isLockFreeReadsOp());
 }
+
+/**
+ * Type that pretends to be a Collection. It implements the minimal interface used by
+ * acquireCollectionAndConsistentSnapshot(). We are tricking acquireCollectionAndConsistentSnapshot
+ * to establish a consistent snapshot with just the catalog and not for a specific Collection.
+ */
+class FakeCollection {
+public:
+    // We just need to return something that would not considered to be the oplog. A default
+    // constructed NamespaceString is fine.
+    const NamespaceString& ns() const {
+        return _ns;
+    };
+    // We just need to return something that compares equal with itself here.
+    boost::optional<Timestamp> getMinimumVisibleSnapshot() const {
+        return boost::none;
+    }
+
+private:
+    NamespaceString _ns;
+};
 
 /**
  * Helper function to acquire a collection and consistent snapshot without holding the RSTL or
@@ -109,6 +133,10 @@ auto acquireCollectionAndConsistentSnapshot(
         // If this is a nested lock acquisition, then we already have a consistent stashed catalog
         // and snapshot from which to read and we can skip the below logic.
         if (isLockFreeReadSubOperation) {
+            // A consistent in-memory and on-disk state is already set up by a higher level AutoGet*
+            // instance. Save the catalog on this instance, to retain it against out-of-order
+            // AutoGet* destruction, and return early.
+            catalogStasher.stash(catalog);
             return collection;
         }
 
@@ -146,8 +174,8 @@ auto acquireCollectionAndConsistentSnapshot(
 
         LOGV2_DEBUG(5067701,
                     3,
-                    "Retrying acquiring state for lock-free read because collection or replication "
-                    "state changed.");
+                    "Retrying acquiring state for lock-free read because collection, catalog or "
+                    "replication state changed.");
         reset();
         opCtx->recoveryUnit()->abandonSnapshot();
     }
@@ -591,35 +619,35 @@ const NamespaceString& AutoGetCollectionForReadCommandMaybeLockFree::getNss() co
     }
 }
 
+AutoReadLockFree::AutoReadLockFree(OperationContext* opCtx, Date_t deadline)
+    : _catalogStash(opCtx),
+      _lockFreeReadsBlock(opCtx),
+      _globalLock(
+          opCtx, MODE_IS, deadline, Lock::InterruptBehavior::kThrow, true /* skipRSTLLock */) {
+    // The catalog will be stashed inside the CollectionCatalogStasher.
+    FakeCollection fakeColl;
+    acquireCollectionAndConsistentSnapshot(
+        opCtx,
+        /* isLockFreeReadSubOperation */
+        false,
+        /* CollectionCatalogStasher */
+        _catalogStash,
+        /* GetCollectionAndEstablishReadSourceFunc */
+        [&](OperationContext* opCtx, const CollectionCatalog&) { return &fakeColl; },
+        /* GetCollectionAfterSnapshotFunc */
+        [&](OperationContext* opCtx, const CollectionCatalog& catalog) { return &fakeColl; },
+        /* ResetFunc */
+        []() {});
+}
+
 AutoGetDbForReadLockFree::AutoGetDbForReadLockFree(OperationContext* opCtx,
                                                    StringData dbName,
                                                    Date_t deadline)
-    : _lockFreeReadsBlock(opCtx),
+    : _catalogStash(opCtx),
+      _lockFreeReadsBlock(opCtx),
       _globalLock(
-          opCtx, MODE_IS, deadline, Lock::InterruptBehavior::kThrow, true /* skipRSTLLock */),
-      _catalogStash(opCtx) {
-
-    // Type that pretends to be a Collection. It implements the minimal interface used by
-    // acquireCollectionAndConsistentSnapshot(). We are tricking
-    // acquireCollectionAndConsistentSnapshot to establish a consistent snapshot with just the
-    // catalog and not for a specific Collection.
-    class FakeCollection {
-    public:
-        // We just need to return something that would not considered to be the oplog. A default
-        // constructed NamespaceString is fine.
-        const NamespaceString& ns() const {
-            return _ns;
-        };
-        // We just need to return something that compares equal with itself here.
-        boost::optional<Timestamp> getMinimumVisibleSnapshot() const {
-            return boost::none;
-        }
-
-    private:
-        NamespaceString _ns;
-    };
-
-    // The catalog will be stashed inside the CollectionCatalogStasher
+          opCtx, MODE_IS, deadline, Lock::InterruptBehavior::kThrow, true /* skipRSTLLock */) {
+    // The catalog will be stashed inside the CollectionCatalogStasher.
     FakeCollection fakeColl;
     acquireCollectionAndConsistentSnapshot(
         opCtx,

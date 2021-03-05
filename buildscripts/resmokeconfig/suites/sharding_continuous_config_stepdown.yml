@@ -117,6 +117,7 @@ selector:
   - jstests/sharding/ssv_config_check.js
   # Runs replSetGetStatus -- via awaitLastOpCommitted -- directly against the config server:
   # retries aren't supported.
+  - jstests/sharding/catalog_refresh_while_set_fcv.js
   - jstests/sharding/coll_epoch_test1.js
   - jstests/sharding/move_stale_mongos.js
   - jstests/sharding/shard4.js
@@ -156,7 +157,7 @@ selector:
   # listCollections is not retryable
   - jstests/sharding/sessions_collection_auto_healing.js
   # shardCollection is not retryable
-  - jstests/sharding/shard_config_db_collections.js
+  - jstests/sharding/shard_collection_config_db.js
   # creates collection, does movePrimary, then shards the collection and moves a chunk to the old
   # primary (SERVER-31909)
   - jstests/sharding/mongos_validate_writes.js
@@ -231,6 +232,9 @@ selector:
 
   # SERVER-51805 splitChunk op is not idempotent
   - jstests/sharding/mongos_get_shard_version.js
+
+  exclude_with_any_tags:
+  - does_not_support_config_stepdowns
 
 executor:
   config:

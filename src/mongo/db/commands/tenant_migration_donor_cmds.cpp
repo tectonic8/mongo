@@ -35,7 +35,6 @@
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/tenant_migration_access_blocker_util.h"
-#include "mongo/db/repl/tenant_migration_committed_info.h"
 #include "mongo/db/repl/tenant_migration_donor_service.h"
 
 namespace mongo {
@@ -61,6 +60,12 @@ public:
                     "donorStartMigration command not enabled",
                     repl::feature_flags::gTenantMigrations.isEnabled(
                         serverGlobalParams.featureCompatibility));
+
+            // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
+            uassert(
+                5356100,
+                "donorStartMigration not available while upgrading or downgrading the donor FCV",
+                !serverGlobalParams.featureCompatibility.isUpgradingOrDowngrading());
 
             const auto& cmd = request();
 
@@ -272,8 +277,7 @@ public:
 
             auto durableState = donor->getDurableState(opCtx);
 
-            uassert(TenantMigrationCommittedInfo(donor->getTenantId().toString(),
-                                                 donor->getRecipientConnectionString().toString()),
+            uassert(ErrorCodes::TenantMigrationCommitted,
                     "Tenant migration already committed",
                     durableState.state == TenantMigrationDonorStateEnum::kAborted);
         }

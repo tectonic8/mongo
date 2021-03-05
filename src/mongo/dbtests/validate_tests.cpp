@@ -73,12 +73,16 @@ public:
         auto db = autoDb.getDb();
         ASSERT_TRUE(db);
 
+        _supportsClusteredIdIndex =
+            _opCtx.getServiceContext()->getStorageEngine()->supportsClusteredIdIndex();
+
         CollectionOptions options;
-        if (clustered) {
+        if (clustered && _supportsClusteredIdIndex) {
             options.clusteredIndex = ClusteredIndexOptions{};
         }
 
-        auto coll = db->createCollection(&_opCtx, _nss, options);
+        const bool createIdIndex = !clustered;
+        auto coll = db->createCollection(&_opCtx, _nss, options, createIdIndex);
         ASSERT_TRUE(coll);
         wuow.commit();
 
@@ -190,6 +194,7 @@ protected:
     Database* _db;
     bool _isInRecordIdOrder;
     bool _engineSupportsCheckpoints;
+    bool _supportsClusteredIdIndex;
 };
 
 template <bool full, bool background>
@@ -3516,6 +3521,10 @@ public:
         : ValidateBase(/*full=*/false, background, /*clustered=*/true) {}
 
     void run() {
+        if (!_supportsClusteredIdIndex) {
+            return;
+        }
+
         // Cannot run validate with {background:true} if either
         //  - the RecordStore cursor does not retrieve documents in RecordId order
         //  - or the storage engine does not support checkpoints.
@@ -3568,6 +3577,248 @@ public:
             ASSERT_EQ(static_cast<size_t>(0), results.missingIndexEntries.size());
             ASSERT_EQ(static_cast<size_t>(1), results.corruptRecords.size());
             ASSERT_EQ(rid, results.corruptRecords[0]);
+
+            dumpOnErrorGuard.dismiss();
+        }
+    }
+};
+
+template <bool background>
+class ValidateReportInfoOnClusteredCollection : public ValidateBase {
+public:
+    ValidateReportInfoOnClusteredCollection()
+        : ValidateBase(/*full=*/false, background, /*clustered=*/true) {}
+
+    void run() {
+        if (!_supportsClusteredIdIndex) {
+            return;
+        }
+
+        // Cannot run validate with {background:true} if either
+        //  - the RecordStore cursor does not retrieve documents in RecordId order
+        //  - or the storage engine does not support checkpoints.
+        if (_background && (!_isInRecordIdOrder || !_engineSupportsCheckpoints)) {
+            return;
+        }
+
+        lockDb(MODE_X);
+        CollectionPtr coll =
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, _nss);
+        ASSERT(coll);
+
+        // Create an index.
+        const auto indexName = "a";
+        const auto indexKey = BSON("a" << 1);
+        auto status = dbtests::createIndexFromSpec(
+            &_opCtx,
+            coll->ns().ns(),
+            BSON("name" << indexName << "key" << indexKey << "v" << static_cast<int>(kIndexVersion)
+                        << "background" << false));
+        ASSERT_OK(status);
+
+        // Insert documents.
+        OpDebug* const nullOpDebug = nullptr;
+        RecordId rid = RecordId::minLong();
+        lockDb(MODE_X);
+
+        const OID firstRecordId = OID::gen();
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(
+                coll->insertDocument(&_opCtx,
+                                     InsertStatement(BSON("_id" << firstRecordId << "a" << 1)),
+                                     nullOpDebug,
+                                     true));
+            ASSERT_OK(coll->insertDocument(&_opCtx,
+                                           InsertStatement(BSON("_id" << OID::gen() << "a" << 2)),
+                                           nullOpDebug,
+                                           true));
+            ASSERT_OK(coll->insertDocument(&_opCtx,
+                                           InsertStatement(BSON("_id" << OID::gen() << "a" << 3)),
+                                           nullOpDebug,
+                                           true));
+            rid = coll->getCursor(&_opCtx)->next()->id;
+            wunit.commit();
+        }
+        releaseDb();
+        ensureValidateWorked();
+        lockDb(MODE_X);
+
+        RecordStore* rs = coll->getRecordStore();
+
+        // Updating a document without updating the index entry will cause validation to detect a
+        // missing index entry and an extra index entry.
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            auto doc = BSON("_id" << firstRecordId << "a" << 5);
+            auto updateStatus = rs->updateRecord(&_opCtx, rid, doc.objdata(), doc.objsize());
+            ASSERT_OK(updateStatus);
+            wunit.commit();
+        }
+        releaseDb();
+
+        {
+            auto mode = _background ? CollectionValidation::ValidateMode::kBackground
+                                    : CollectionValidation::ValidateMode::kForeground;
+
+            ValidateResults results;
+            BSONObjBuilder output;
+
+            ASSERT_OK(CollectionValidation::validate(&_opCtx,
+                                                     _nss,
+                                                     mode,
+                                                     CollectionValidation::RepairMode::kNone,
+                                                     &results,
+                                                     &output,
+                                                     kTurnOnExtraLoggingForTest));
+
+            auto dumpOnErrorGuard = makeGuard([&] {
+                StorageDebugUtil::printValidateResults(results);
+                StorageDebugUtil::printCollectionAndIndexTableEntries(&_opCtx, coll->ns());
+            });
+
+            ASSERT_EQ(false, results.valid);
+            ASSERT_EQ(static_cast<size_t>(1), results.errors.size());
+            ASSERT_EQ(static_cast<size_t>(2), results.warnings.size());
+            ASSERT_EQ(static_cast<size_t>(1), results.extraIndexEntries.size());
+            ASSERT_EQ(static_cast<size_t>(1), results.missingIndexEntries.size());
+
+            dumpOnErrorGuard.dismiss();
+        }
+    }
+};
+
+class ValidateRepairOnClusteredCollection : public ValidateBase {
+public:
+    ValidateRepairOnClusteredCollection()
+        : ValidateBase(/*full=*/false, /*background=*/false, /*clustered=*/true) {}
+
+    void run() {
+        if (!_supportsClusteredIdIndex) {
+            return;
+        }
+
+        // Cannot run validate with {background:true} if either
+        //  - the RecordStore cursor does not retrieve documents in RecordId order
+        //  - or the storage engine does not support checkpoints.
+        if (_background && (!_isInRecordIdOrder || !_engineSupportsCheckpoints)) {
+            return;
+        }
+
+        lockDb(MODE_X);
+        CollectionPtr coll =
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, _nss);
+        ASSERT(coll);
+
+        // Create an index.
+        const auto indexName = "a";
+        const auto indexKey = BSON("a" << 1);
+        auto status = dbtests::createIndexFromSpec(
+            &_opCtx,
+            coll->ns().ns(),
+            BSON("name" << indexName << "key" << indexKey << "v" << static_cast<int>(kIndexVersion)
+                        << "background" << false));
+        ASSERT_OK(status);
+
+        // Insert documents.
+        OpDebug* const nullOpDebug = nullptr;
+        RecordId rid = RecordId::minLong();
+        lockDb(MODE_X);
+
+        const OID firstRecordId = OID::gen();
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(
+                coll->insertDocument(&_opCtx,
+                                     InsertStatement(BSON("_id" << firstRecordId << "a" << 1)),
+                                     nullOpDebug,
+                                     true));
+            ASSERT_OK(coll->insertDocument(&_opCtx,
+                                           InsertStatement(BSON("_id" << OID::gen() << "a" << 2)),
+                                           nullOpDebug,
+                                           true));
+            ASSERT_OK(coll->insertDocument(&_opCtx,
+                                           InsertStatement(BSON("_id" << OID::gen() << "a" << 3)),
+                                           nullOpDebug,
+                                           true));
+            rid = coll->getCursor(&_opCtx)->next()->id;
+            wunit.commit();
+        }
+        releaseDb();
+        ensureValidateWorked();
+        lockDb(MODE_X);
+
+        RecordStore* rs = coll->getRecordStore();
+
+        // Updating a document without updating the index entry will cause validation to detect a
+        // missing index entry and an extra index entry.
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            auto doc = BSON("_id" << firstRecordId << "a" << 5);
+            auto updateStatus = rs->updateRecord(&_opCtx, rid, doc.objdata(), doc.objsize());
+            ASSERT_OK(updateStatus);
+            wunit.commit();
+        }
+        releaseDb();
+
+        {
+            auto mode = _background ? CollectionValidation::ValidateMode::kBackground
+                                    : CollectionValidation::ValidateMode::kForeground;
+
+            ValidateResults results;
+            BSONObjBuilder output;
+
+            ASSERT_OK(CollectionValidation::validate(&_opCtx,
+                                                     _nss,
+                                                     mode,
+                                                     CollectionValidation::RepairMode::kNone,
+                                                     &results,
+                                                     &output,
+                                                     kTurnOnExtraLoggingForTest));
+
+            auto dumpOnErrorGuard = makeGuard([&] {
+                StorageDebugUtil::printValidateResults(results);
+                StorageDebugUtil::printCollectionAndIndexTableEntries(&_opCtx, coll->ns());
+            });
+
+            ASSERT_EQ(false, results.valid);
+            ASSERT_EQ(static_cast<size_t>(1), results.errors.size());
+            ASSERT_EQ(static_cast<size_t>(2), results.warnings.size());
+            ASSERT_EQ(static_cast<size_t>(1), results.extraIndexEntries.size());
+            ASSERT_EQ(static_cast<size_t>(1), results.missingIndexEntries.size());
+
+            dumpOnErrorGuard.dismiss();
+        }
+
+        // Run validate with repair, expect that extra index entries are removed and missing index
+        // entries are inserted.
+        {
+            ValidateResults results;
+            BSONObjBuilder output;
+
+            ASSERT_OK(
+                CollectionValidation::validate(&_opCtx,
+                                               _nss,
+                                               CollectionValidation::ValidateMode::kForegroundFull,
+                                               CollectionValidation::RepairMode::kFixErrors,
+                                               &results,
+                                               &output,
+                                               kTurnOnExtraLoggingForTest));
+
+            auto dumpOnErrorGuard = makeGuard([&] {
+                StorageDebugUtil::printValidateResults(results);
+                StorageDebugUtil::printCollectionAndIndexTableEntries(&_opCtx, coll->ns());
+            });
+
+
+            ASSERT_EQ(true, results.valid);
+            ASSERT_EQ(true, results.repaired);
+            ASSERT_EQ(static_cast<size_t>(0), results.errors.size());
+            ASSERT_EQ(static_cast<size_t>(2), results.warnings.size());
+            ASSERT_EQ(static_cast<size_t>(0), results.extraIndexEntries.size());
+            ASSERT_EQ(static_cast<size_t>(0), results.missingIndexEntries.size());
+            ASSERT_EQ(1, results.numRemovedExtraIndexEntries);
+            ASSERT_EQ(1, results.numInsertedMissingIndexEntries);
 
             dumpOnErrorGuard.dismiss();
         }
@@ -3637,8 +3888,12 @@ public:
 
         add<ValidateAddNewMultikeyPaths>();
 
+        // Tests that validation works on clustered collections.
         add<ValidateInvalidBSONOnClusteredCollection<false>>();
         add<ValidateInvalidBSONOnClusteredCollection<true>>();
+        add<ValidateReportInfoOnClusteredCollection<false>>();
+        add<ValidateReportInfoOnClusteredCollection<true>>();
+        add<ValidateRepairOnClusteredCollection>();
     }
 };
 

@@ -375,11 +375,11 @@ public:
                             ListCollectionsFilter::makeTypeCollectionFilter());
 
                     if (!skipViews) {
-                        viewCatalog->iterate(opCtx, [&](const ViewDefinition& view) {
+                        viewCatalog->iterate([&](const ViewDefinition& view) {
                             if (authorizedCollections &&
                                 !as->isAuthorizedForAnyActionOnResource(
                                     ResourcePattern::forExactNamespace(view.name()))) {
-                                return;
+                                return true;
                             }
 
                             BSONObj viewBson = buildViewBson(view, nameOnly);
@@ -387,6 +387,7 @@ public:
                                 _addWorkingSetMember(
                                     opCtx, viewBson, matcher.get(), ws.get(), root.get());
                             }
+                            return true;
                         });
                     }
                 }

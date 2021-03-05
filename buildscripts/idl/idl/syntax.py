@@ -411,6 +411,17 @@ class Validator(common.SourceLocation):
 
         super(Validator, self).__init__(file_name, line, column)
 
+    def __eq__(self, other):
+        return (isinstance(other, Validator) and self.gt == other.gt and self.lt == other.lt
+                and self.gte == other.gte and self.lte == other.lte
+                and self.callback == other.callback)
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __hash__(self):
+        return hash((self.gt, self.lt, self.gte, self.lte, self.callback))
+
 
 class Field(common.SourceLocation):
     """
@@ -516,6 +527,31 @@ class Struct(common.SourceLocation):
         super(Struct, self).__init__(file_name, line, column)
 
 
+class AccessCheck(common.SourceLocation):
+    """IDL access check information."""
+
+    def __init__(self, file_name, line, column):
+        # type: (str, int, int) -> None
+        """Construct an AccessCheck."""
+
+        self.check = None  # type: str
+
+        super(AccessCheck, self).__init__(file_name, line, column)
+
+
+class AccessChecks(common.SourceLocation):
+    """IDL access checks information."""
+
+    def __init__(self, file_name, line, column):
+        # type: (str, int, int) -> None
+        """Construct an AccessChecks."""
+
+        self.none = None  # type: bool
+        self.simple = None  # type: AccessCheck
+
+        super(AccessChecks, self).__init__(file_name, line, column)
+
+
 class Command(Struct):
     """
     IDL command information, a subtype of Struct.
@@ -535,6 +571,7 @@ class Command(Struct):
         self.reply_type = None  # type: str
         self.api_version = None  # type: str
         self.is_deprecated = False  # type: bool
+        self.access_check = None  # type: AccessChecks
         super(Command, self).__init__(file_name, line, column)
 
 
@@ -587,7 +624,8 @@ class EnumValue(common.SourceLocation):
         super(EnumValue, self).__init__(file_name, line, column)
 
     def __eq__(self, other):
-        return self.name == other.name and self.value == other.value
+        return (isinstance(other, EnumValue) and self.name == other.name
+                and self.value == other.value)
 
     def __ne__(self, other):
         return not self == other
@@ -700,6 +738,16 @@ class Expression(common.SourceLocation):
         self.is_constexpr = True  # type: bool
 
         super(Expression, self).__init__(file_name, line, column)
+
+    def __eq__(self, other):
+        return (isinstance(other, Expression) and self.literal == other.literal
+                and self.expr == other.expr and self.is_constexpr == other.is_constexpr)
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __hash__(self):
+        return hash((self.literal, self.expr, self.is_constexpr))
 
 
 class ServerParameterClass(common.SourceLocation):

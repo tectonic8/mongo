@@ -238,9 +238,9 @@ void _validateKeyOrder(OperationContext* opCtx,
         if (results && results->valid) {
             auto bsonKey = KeyString::toBson(currKey, Ordering::make(descriptor->keyPattern()));
             auto firstRecordId =
-                KeyString::decodeRecordIdAtEnd(prevKey.getBuffer(), prevKey.getSize());
+                KeyString::decodeRecordIdLongAtEnd(prevKey.getBuffer(), prevKey.getSize());
             auto secondRecordId =
-                KeyString::decodeRecordIdAtEnd(currKey.getBuffer(), currKey.getSize());
+                KeyString::decodeRecordIdLongAtEnd(currKey.getBuffer(), currKey.getSize());
             results->errors.push_back(str::stream() << "Unique index '" << descriptor->indexName()
                                                     << "' has duplicate key: " << bsonKey
                                                     << ", first record: " << firstRecordId
@@ -299,8 +299,18 @@ void ValidateAdaptor::traverseIndex(OperationContext* opCtx,
                 opCtx, index, indexEntry->keyString, prevIndexKeyStringValue, &indexResults);
         }
 
-        const RecordId kWildcardMultikeyMetadataRecordId{
-            RecordId::reservedIdFor<int64_t>(RecordId::Reservation::kWildcardMultikeyMetadataId)};
+
+        const RecordId kWildcardMultikeyMetadataRecordId = [&]() {
+            auto keyFormat = _validateState->getCollection()->getRecordStore()->keyFormat();
+            if (keyFormat == KeyFormat::Long) {
+                return RecordId::reservedIdFor<int64_t>(
+                    RecordId::Reservation::kWildcardMultikeyMetadataId);
+            } else {
+                invariant(keyFormat == KeyFormat::String);
+                return RecordId::reservedIdFor<OID>(
+                    RecordId::Reservation::kWildcardMultikeyMetadataId);
+            }
+        }();
         if (descriptor->getIndexType() == IndexType::INDEX_WILDCARD &&
             indexEntry->loc == kWildcardMultikeyMetadataRecordId) {
             _indexConsistency->removeMultikeyMetadataPath(indexEntry->keyString, &indexInfo);
@@ -462,6 +472,18 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
         dataSizeTotal += dataSize;
         size_t validatedSize = 0;
         Status status = validateRecord(opCtx, record->id, record->data, &validatedSize, results);
+
+        // TODO SERVER-54481 : Disable double validate.
+        auto doubleValidateRecord = traverseRecordStoreCursor->seekExact(opCtx, record->id);
+        if (!doubleValidateRecord || doubleValidateRecord->id != record->id ||
+            doubleValidateRecord->data.size() != record->data.size()) {
+            LOGV2(
+                5355600,
+                "Document corruption details - Document validation failure; double validate failed",
+                "recordId"_attr = record->id);
+            results->errors.push_back("Detected one or more invalid documents. See logs.");
+            results->valid = false;
+        }
 
         // Checks to ensure isInRecordIdOrder() is being used properly.
         if (prevRecordId.isValid()) {

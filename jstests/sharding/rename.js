@@ -57,7 +57,9 @@ if (!isDDLFeatureFlagEnabled) {
 // Renaming unsharded collection to a different db with different primary shard.
 db.unSharded.insert({x: 1});
 assert.commandFailedWithCode(
-    db.adminCommand({renameCollection: 'test.unSharded', to: 'otherPrimary.foo'}), 13137);
+    db.adminCommand({renameCollection: 'test.unSharded', to: 'otherPrimary.foo'}),
+    [13137, 5448802],
+    "Source and destination collections must be on same shard");
 
 // Renaming unsharded collection to a different db with same primary shard.
 assert.commandWorked(db.adminCommand({renameCollection: 'test.unSharded', to: 'samePrimary.foo'}));
@@ -91,9 +93,6 @@ awaitRSClientHosts(s.s, replTest.getPrimary(), {ok: true, ismaster: true}, replT
 
 assert.commandWorked(db.foo.insert({_id: 4}));
 assert.commandWorked(db.foo.renameCollection('bar', true));
-
-ans = db.runCommand({getLastError: 1, w: 3, wtimeout: 5000});
-assert.eq(ans.err, "timeout", 'gle: ' + tojson(ans));
 
 s.stop();
 })();

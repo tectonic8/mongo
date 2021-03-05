@@ -31,6 +31,7 @@
 
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/window_function/window_bounds.h"
 
 namespace mongo {
 
@@ -42,7 +43,7 @@ class PartitionIterator {
 public:
     PartitionIterator(ExpressionContext* expCtx,
                       DocumentSource* source,
-                      boost::optional<const ExpressionFieldPath&> partitionExpr)
+                      boost::optional<boost::intrusive_ptr<Expression>> partitionExpr)
         : _expCtx(expCtx),
           _source(source),
           _partitionExpr(partitionExpr),
@@ -68,6 +69,39 @@ public:
      */
     AdvanceResult advance();
 
+    /**
+     * Returns the offset of the iterator for the current partition.
+     */
+    auto getCurrentOffset() const {
+        return _currentIndex;
+    }
+
+    /**
+     * Sets the input DocumentSource for this iterator to 'source'.
+     */
+    void setSource(DocumentSource* source) {
+        _source = source;
+    }
+
+    /**
+     * Resolve any type of WindowBounds to a concrete pair of indices, '[lower, upper]'.
+     *
+     * Both 'lower' and 'upper' are valid offsets, such that '(*this)[lower]' and '(*this)[upper]'
+     * returns a document. If the window contains one document, then 'lower == upper'. If the
+     * window contains zero documents, then there are no valid offsets, so we return boost::none.
+     * (The window can be empty when it is shifted completely past one end of the partition, as in
+     *  [+999, +999] or [-999, -999].)
+     *
+     * The offsets can be different after every 'advance()'. Even for simple document-based
+     * windows, the returned offsets can be different than the user-specified bounds when we
+     * are close to a partition boundary.  For example, at the beginning of a partition,
+     * 'getEndpoints(DocumentBased{-10, +7})' would be '[0, +7]'.
+     *
+     * This method is non-const because it may pull documents into memory up to the end of the
+     * window.
+     */
+    boost::optional<std::pair<int, int>> getEndpoints(const WindowBounds& bounds);
+
 private:
     /**
      * Retrieves the next document from the prior stage and updates the state accordingly.
@@ -91,8 +125,9 @@ private:
 
     ExpressionContext* _expCtx;
     DocumentSource* _source;
-    boost::optional<const ExpressionFieldPath&> _partitionExpr;
+    boost::optional<boost::intrusive_ptr<Expression>> _partitionExpr;
     std::vector<Document> _cache;
+    // '_cache[_currentIndex]' is the current document, which '(*this)[0]' returns.
     int _currentIndex = 0;
     Value _partitionKey;
 
@@ -107,12 +142,14 @@ private:
     enum class IteratorState {
         // Default state, no documents have been pulled into the cache.
         kNotInitialized,
-        // Iterating the current partition.
+        // Iterating the current partition. We don't know where the current partition ends, or
+        // whether it's the last partition.
         kIntraPartition,
         // The first document of the next partition has been retrieved, but the iterator has not
         // advanced to it yet.
         kAwaitingAdvanceToNext,
-        // Similar to the next partition case, except for EOF.
+        // Similar to the next partition case, except for EOF: we know the current partition is the
+        // final one, because the underlying iterator has returned EOF.
         kAwaitingAdvanceToEOF,
         // The iterator has exhausted the input documents. Any access should be disallowed.
         kAdvancedToEOF,

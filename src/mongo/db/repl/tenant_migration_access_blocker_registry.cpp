@@ -28,7 +28,7 @@
  */
 
 #include "mongo/db/repl/tenant_migration_access_blocker_registry.h"
-#include "mongo/db/repl/tenant_migration_donor_access_blocker.h"
+#include "mongo/db/repl/tenant_migration_access_blocker.h"
 
 namespace mongo {
 
@@ -45,9 +45,7 @@ void TenantMigrationAccessBlockerRegistry::add(StringData tenantId,
 
     if (it != _tenantMigrationAccessBlockers.end()) {
         uasserted(ErrorCodes::ConflictingOperationInProgress,
-                  str::stream() << "Found active migration for tenantId \"" << it->first
-                                << "\" which conflicts with the specified tenantId \"" << tenantId
-                                << "\"");
+                  str::stream() << "Found active migration for tenantId \"" << tenantId << "\"");
     }
 
     _tenantMigrationAccessBlockers.emplace(tenantId, mtab);

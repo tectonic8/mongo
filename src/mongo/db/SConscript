@@ -719,9 +719,10 @@ env.Library(
         '$BUILD_DIR/mongo/client/clientdriver_minimal',
         'curop',
         'lasterror',
+        'ops/write_ops_parsers',
     ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+        'repl/repl_coordinator_interface',
     ],
 )
 
@@ -756,30 +757,30 @@ env.Library(
 )
 
 env.Library(
-    target="service_context_d",
+    target='service_context_d',
     source=[
-        "service_entry_point_mongod.cpp",
+        'service_entry_point_mongod.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/auth/auth',
-        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
-        '$BUILD_DIR/mongo/db/s/sharding_runtime_d',
-        '$BUILD_DIR/mongo/db/storage/storage_engine_common',
-        '$BUILD_DIR/mongo/db/storage/storage_engine_lock_file',
-        '$BUILD_DIR/mongo/db/storage/storage_engine_metadata',
-        '$BUILD_DIR/mongo/db/storage/storage_options',
         '$BUILD_DIR/mongo/transport/service_entry_point',
+        'auth/auth',
         'command_can_run_here',
+        'concurrency/lock_manager',
         'curop',
         'curop_metrics',
         'lasterror',
         'rw_concern_d',
+        's/sharding_runtime_d',
+        'storage/storage_engine_common',
+        'storage/storage_engine_lock_file',
+        'storage/storage_engine_metadata',
+        'storage/storage_options',
     ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/commands/fsync_locked',
-        '$BUILD_DIR/mongo/db/service_entry_point_common',
+        'commands/fsync_locked',
         'read_concern_d_impl',
+        'service_entry_point_common',
     ],
 )
 
@@ -868,6 +869,7 @@ env.Library(
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/audit',
         '$BUILD_DIR/mongo/db/auth/auth',
+        '$BUILD_DIR/mongo/db/auth/auth_umc',
         '$BUILD_DIR/mongo/db/auth/authprivilege',
         '$BUILD_DIR/mongo/db/command_can_run_here',
         '$BUILD_DIR/mongo/db/curop_metrics',
@@ -1135,6 +1137,16 @@ env.Library(
 )
 
 env.Library(
+    target='record_id_helpers',
+    source=[
+        'record_id_helpers.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
+)
+
+env.Library(
     target='query_exec',
     source=[
         'clientcursor.cpp',
@@ -1184,6 +1196,7 @@ env.Library(
         'exec/upsert_stage.cpp',
         'exec/working_set_common.cpp',
         'exec/write_stage_common.cpp',
+        'ops/delete_request.idl',
         'ops/parsed_delete.cpp',
         'ops/update_result.cpp',
         'pipeline/document_source_cursor.cpp',
@@ -1196,8 +1209,9 @@ env.Library(
         'query/find.cpp',
         'query/get_executor.cpp',
         'query/internal_plans.cpp',
-        'query/plan_executor_impl.cpp',
+        'query/plan_executor.cpp',
         'query/plan_executor_factory.cpp',
+        'query/plan_executor_impl.cpp',
         'query/plan_executor_sbe.cpp',
         'query/plan_explainer_factory.cpp',
         'query/plan_explainer_impl.cpp',
@@ -1220,6 +1234,7 @@ env.Library(
         'query/shard_filterer_factory_impl.cpp',
         'query/stage_builder_util.cpp',
         'query/wildcard_multikey_paths.cpp',
+        'query/yield_policy_callbacks_impl.cpp',
         'run_op_kill_cursors.cpp',
     ],
     LIBDEPS=[
@@ -1266,7 +1281,6 @@ env.Library(
         's/sharding_api_d',
         'shared_request_handling',
         'stats/serveronly_stats',
-        'storage/oplog_hack',
         'storage/remove_saver',
         'storage/storage_options',
         'update/update_driver',
@@ -1703,6 +1717,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/transport/transport_layer_common',
+        'auth/auth',
         'auth/authprivilege',
         'global_settings',
         'keys_collection_client_sharded',
@@ -1915,7 +1930,6 @@ env.Library(
         'ops/update.cpp',
         'ops/write_ops_retryability.cpp',
         'ops/single_write_result.idl',
-        'ops/delete_request.idl',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -2068,7 +2082,6 @@ env.Library(
         'query_exec',
         'read_concern_d_impl',
         'read_write_concern_defaults',
-        'repl/bgsync',
         'repl/oplog_application',
         'repl/oplog_buffer_blocking_queue',
         'repl/oplog_buffer_collection',
@@ -2084,7 +2097,6 @@ env.Library(
         'rw_concern_d',
         's/sessions_collection_config_server',
         's/sharding_commands_d',
-        's/sharding_runtime_d',
         'service_context_d',
         'service_liaison_mongod',
         'sessions_collection_rs',
@@ -2144,6 +2156,7 @@ env.Library(
         '$BUILD_DIR/mongo/util/cmdline_utils/cmdline_utils',
         '$BUILD_DIR/mongo/util/concurrency/thread_pool',
         '$BUILD_DIR/mongo/util/latch_analyzer' if get_option('use-diagnostic-latches') == 'on' else [],
+        '$BUILD_DIR/mongo/util/net/http_client_impl',
         '$BUILD_DIR/mongo/util/net/ssl_manager',
         '$BUILD_DIR/mongo/util/signal_handlers',
         '$BUILD_DIR/mongo/watchdog/watchdog_mongod',
@@ -2181,6 +2194,7 @@ env.Library(
         'repl/topology_coordinator',
         'repl/wait_for_majority_service',
         's/sessions_collection_config_server',
+        's/sharding_commands_d',
         's/sharding_runtime_d',
         'serverinit',
         'service_context_d',
@@ -2251,6 +2265,9 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/transport/transport_layer_mock',
+    ],
+    LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/auth/auth',
         '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/catalog/catalog_impl',
@@ -2258,9 +2275,26 @@ env.Library(
         '$BUILD_DIR/mongo/db/repl/replmocks',
         '$BUILD_DIR/mongo/db/s/sharding_api_d',
         '$BUILD_DIR/mongo/db/service_context_d',
+        '$BUILD_DIR/mongo/db/storage/ephemeral_for_test/storage_ephemeral_for_test',
+        '$BUILD_DIR/mongo/db/storage/storage_control',
+        '$BUILD_DIR/mongo/db/storage/storage_options',
+        '$BUILD_DIR/mongo/rpc/rpc',
         '$BUILD_DIR/mongo/transport/service_entry_point',
-        '$BUILD_DIR/mongo/transport/transport_layer_mock',
         '$BUILD_DIR/mongo/unittest/unittest',
+    ],
+)
+
+# TODO(SERVER-45266) This could be part of db_unittest_test but it needs to mutate
+# storageGlobalParams.
+env.CppUnitTest(
+    target='op_msg_fuzzer_fixture_test',
+    source=[
+        'op_msg_fuzzer_fixture_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/op_msg_fuzzer_fixture',
+        '$BUILD_DIR/mongo/rpc/rpc',
     ],
 )
 
@@ -2294,7 +2328,6 @@ if wiredtiger:
             'mirroring_sampler_test.cpp',
             'multi_key_path_tracker_test.cpp',
             'namespace_string_test.cpp',
-            'op_msg_fuzzer_fixture_test.cpp',
             'op_observer_impl_test.cpp',
             'op_observer_registry_test.cpp',
             'operation_context_test.cpp',
@@ -2330,7 +2363,6 @@ if wiredtiger:
             '$BUILD_DIR/mongo/db/catalog/import_collection_oplog_entry',
             '$BUILD_DIR/mongo/db/catalog/index_build_entry_idl',
             '$BUILD_DIR/mongo/db/mongohasher',
-            '$BUILD_DIR/mongo/db/op_msg_fuzzer_fixture',
             '$BUILD_DIR/mongo/db/query/explain_options',
             '$BUILD_DIR/mongo/db/query/query_test_service_context',
             '$BUILD_DIR/mongo/db/storage/wiredtiger/storage_wiredtiger',

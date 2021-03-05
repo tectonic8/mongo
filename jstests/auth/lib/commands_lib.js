@@ -213,7 +213,7 @@ var authCommandsLib = {
           command: {
               _addShard: 1,
               shardIdentity: {
-                  shardName: "shard0000",
+                  shardName: shard0name,
                   clusterId: ObjectId('5b2031806195dffd744258ee'),
                   configsvrConnectionString: "foobarbaz/host:20022,host:20023,host:20024"
               }
@@ -5007,15 +5007,17 @@ var authCommandsLib = {
           testname: "renameCollection_twoDbs",
           command: {renameCollection: firstDbName + ".x", to: secondDbName + ".y"},
           setup: function(db) {
-              assert.writeOK(db.getSiblingDB(firstDbName).x.save({}));
-
-              // Running movePrimary is necessary on mongos, but doesn't exist on non-sharded
-              // systems.
-              if (db.getMongo().isMongos()) {
-                assert.commandWorked(
-                  db.getSiblingDB(adminDbName).runCommand({movePrimary: firstDbName, to: shard0name}));
-                assert.commandWorked(
-                  db.getSiblingDB(adminDbName).runCommand({movePrimary: secondDbName, to: shard0name}));
+            assert.writeOK(db.getSiblingDB(firstDbName).x.save({}));
+            assert.writeOK(db.getSiblingDB(secondDbName).y.save({}));
+            db.getSiblingDB(secondDbName).y.drop();
+            // Running movePrimary is necessary on mongos, but doesn't exist on non-sharded
+            // systems.
+            if (db.getMongo().isMongos()) {
+              const shardId = assert.commandWorked(db.getSiblingDB(adminDbName).runCommand({listShards: 1})).shards[0]['_id'];
+              assert.commandWorked(
+                db.getSiblingDB(adminDbName).runCommand({movePrimary: firstDbName, to: shardId}));
+              assert.commandWorked(
+                db.getSiblingDB(adminDbName).runCommand({movePrimary: secondDbName, to: shardId}));
               }
           },
           teardown: function(db) {
@@ -5635,14 +5637,17 @@ var authCommandsLib = {
               {
                 runOnDb: adminDbName,
                 privileges: [{resource: {db: 'config', collection: 'shards'}, actions: ['update']}],
+                expectFail: true, // shard0name doesn't exist
               },
               {
                 runOnDb: adminDbName,
                 roles: roles_clusterManager,
+                expectFail: true, // shard0name doesn't exist
               },
               {
                 runOnDb: adminDbName,
                 privileges: [{resource: {cluster: true}, actions: ["enableSharding"]}],
+                expectFail: true, // shard0name doesn't exist
               },
           ]
         },
@@ -5665,14 +5670,17 @@ var authCommandsLib = {
                     {resource: {db: 'config', collection: 'shards'}, actions: ['update']},
                     {resource: {db: 'config', collection: 'tags'}, actions: ['find']}
                 ],
+                expectFail: true, // shard0name doesn't exist
               },
               {
                 runOnDb: adminDbName,
                 roles: roles_clusterManager,
+                expectFail: true, // shard0name doesn't exist
               },
               {
                 runOnDb: adminDbName,
                 privileges: [{resource: {cluster: true}, actions: ["enableSharding"]}],
+                expectFail: true, // shard0name doesn't exist
               },
           ]
         },
@@ -5784,10 +5792,11 @@ var authCommandsLib = {
               }]
           },
           skipSharded: false,
+          skipTest: (conn) => true, // TODO SERVER-54877 re-enable this test case
           // Only enterprise knows of this aggregation stage.
-          skipTest:
-              (conn) =>
-                  !conn.getDB("admin").runCommand({buildInfo: 1}).modules.includes("enterprise"),
+          //skipTest:
+          //    (conn) =>
+          //        !conn.getDB("admin").runCommand({buildInfo: 1}).modules.includes("enterprise"),
           testcases: [
               {
                 runOnDb: firstDbName,
@@ -6003,6 +6012,77 @@ var authCommandsLib = {
               },
             ]
         },
+        {
+          testname: "validate_db_metadata_command_specific_db",
+          command: {
+              validateDBMetadata: 1,
+              db: secondDbName,
+              collection: "test",
+              apiParameters: {version: "1", strict: true}
+          },
+          skipSharded: true,
+          setup: function(db) {
+              assert.commandWorked(db.getSiblingDB(firstDbName).createCollection("test"));
+              assert.commandWorked(db.getSiblingDB(secondDbName).createCollection("test"));
+              assert.commandWorked(db.getSiblingDB("ThirdDB").createCollection("test"));
+          },
+          teardown: function(db) {
+              assert.commandWorked(db.getSiblingDB(firstDbName).dropDatabase());
+              assert.commandWorked(db.getSiblingDB(secondDbName).dropDatabase());
+              assert.commandWorked(db.getSiblingDB("ThirdDB").dropDatabase());
+          },
+          testcases: [
+              {
+                  runOnDb: secondDbName,
+                  privileges: [{resource: {db: secondDbName, collection: ""}, actions: ["validate"]}]
+              },
+              {
+                  // Need to have permission on firstDBName to be able to the command on the db.
+                  runOnDb: firstDbName,
+                  privileges: [{resource: {db: secondDbName, collection: ""}, actions: ["validate"]}],
+                  expectAuthzFailure: true
+              },
+              {
+                  runOnDb: firstDbName,
+                  privileges: [
+                      {resource: {db: firstDbName, collection: ""}, actions: ["validate"]},
+                      {resource: {db: secondDbName, collection: ""}, actions: ["validate"]}
+                  ]
+              },
+          ]
+      },
+      {
+          testname: "validate_db_metadata_command_all_dbs",
+          command: {validateDBMetadata: 1, apiParameters: {version: "1", strict: true}},
+          skipSharded: true,
+          setup: function(db) {
+              assert.commandWorked(db.getSiblingDB(firstDbName).createCollection("test"));
+              assert.commandWorked(db.getSiblingDB(secondDbName).createCollection("test"));
+          },
+          teardown: function(db) {
+              assert.commandWorked(db.getSiblingDB(firstDbName).dropDatabase());
+              assert.commandWorked(db.getSiblingDB(secondDbName).dropDatabase());
+          },
+          testcases: [
+              {
+                  // Since the command didn't specify a 'db', it validates all dbs and hence require
+                  // permission to run on all dbs.
+                  runOnDb: secondDbName,
+                  privileges: [{resource: {db: secondDbName, collection: ""}, actions: ["validate"]}],
+                  expectAuthzFailure: true
+              },
+              {
+                  runOnDb: secondDbName,
+                  privileges: [
+                      {resource: {db: "admin", collection: ""}, actions: ["validate"]},
+                      {resource: {db: "config", collection: ""}, actions: ["validate"]},
+                      {resource: {db: "local", collection: ""}, actions: ["validate"]},
+                      {resource: {db: firstDbName, collection: ""}, actions: ["validate"]},
+                      {resource: {db: secondDbName, collection: ""}, actions: ["validate"]}
+                  ]
+              },
+          ]
+      },
     ],
 
     /************* SHARED TEST LOGIC ****************/

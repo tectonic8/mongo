@@ -88,19 +88,23 @@ bool documentBelongsToMe(OperationContext* opCtx,
 
 DonorShardEntry makeDonorShard(ShardId shardId,
                                DonorStateEnum donorState,
-                               boost::optional<Timestamp> minFetchTimestamp) {
+                               boost::optional<Timestamp> minFetchTimestamp,
+                               boost::optional<Status> abortReason) {
     DonorShardEntry entry(shardId);
     entry.setState(donorState);
     emplaceMinFetchTimestampIfExists(entry, minFetchTimestamp);
+    emplaceAbortReasonIfExists(entry, abortReason);
     return entry;
 }
 
 RecipientShardEntry makeRecipientShard(ShardId shardId,
                                        RecipientStateEnum recipientState,
-                                       boost::optional<Timestamp> strictConsistencyTimestamp) {
+                                       boost::optional<Timestamp> strictConsistencyTimestamp,
+                                       boost::optional<Status> abortReason) {
     RecipientShardEntry entry(shardId);
     entry.setState(recipientState);
     emplaceStrictConsistencyTimestampIfExists(entry, strictConsistencyTimestamp);
+    emplaceAbortReasonIfExists(entry, abortReason);
     return entry;
 }
 
@@ -134,56 +138,6 @@ std::set<ShardId> getRecipientShards(OperationContext* opCtx,
     std::set<ShardId> recipients;
     cm.getAllShardIds(&recipients);
     return recipients;
-}
-
-void tellShardsToRefresh(OperationContext* opCtx,
-                         const std::vector<ShardId>& shardIds,
-                         const NamespaceString& nss,
-                         std::shared_ptr<executor::TaskExecutor> executor) {
-    auto cmd = _flushRoutingTableCacheUpdatesWithWriteConcern(nss);
-    cmd.setSyncFromConfig(true);
-    cmd.setDbName(nss.db());
-    auto cmdObj =
-        cmd.toBSON(BSON(WriteConcernOptions::kWriteConcernField << WriteConcernOptions::Majority));
-
-    std::vector<AsyncRequestsSender::Request> requests;
-    for (const auto& shardId : shardIds) {
-        requests.emplace_back(shardId, cmdObj);
-    }
-
-    if (!requests.empty()) {
-        // The _flushRoutingTableCacheUpdatesWithWriteConcern command will fail with a
-        // QueryPlanKilled error response if the config.cache.chunks collection is dropped
-        // concurrently. The config.cache.chunks collection is dropped by the shard when it detects
-        // the sharded collection's epoch having changed. We use kIdempotentOrCursorInvalidated so
-        // the ARS automatically retries in that situation.
-        AsyncRequestsSender ars(opCtx,
-                                executor,
-                                "admin",
-                                requests,
-                                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                                Shard::RetryPolicy::kIdempotentOrCursorInvalidated);
-
-        while (!ars.done()) {
-            // Retrieve the responses and throw at the first failure.
-            auto response = ars.next();
-
-            auto generateErrorContext = [&]() -> std::string {
-                return str::stream()
-                    << "Unable to _flushRoutingTableCacheUpdatesWithWriteConcern for namespace "
-                    << nss.ns() << " on " << response.shardId;
-            };
-
-            auto shardResponse =
-                uassertStatusOKWithContext(std::move(response.swResponse), generateErrorContext());
-
-            auto status = getStatusFromCommandResult(shardResponse.data);
-            uassertStatusOKWithContext(status, generateErrorContext());
-
-            auto wcStatus = getWriteConcernStatusFromCommandResult(shardResponse.data);
-            uassertStatusOKWithContext(wcStatus, generateErrorContext());
-        }
-    }
 }
 
 void checkForHolesAndOverlapsInChunks(std::vector<ReshardedChunk>& chunks,
@@ -533,7 +487,7 @@ boost::optional<ShardId> getDestinedRecipient(OperationContext* opCtx,
 
     uassertStatusOK(tempNssRoutingInfo);
 
-    auto shardKey = reshardingKeyPattern->extractShardKeyFromDoc(fullDocument);
+    auto shardKey = reshardingKeyPattern->extractShardKeyFromDocThrows(fullDocument);
 
     return tempNssRoutingInfo.getValue()
         .findIntersectingChunkWithSimpleCollation(shardKey)
@@ -563,9 +517,15 @@ bool isFinalOplog(const repl::OplogEntry& oplog, UUID reshardingUUID) {
 }
 
 
-NamespaceString getLocalOplogBufferNamespace(UUID reshardingUUID, ShardId donorShardId) {
+NamespaceString getLocalOplogBufferNamespace(UUID existingUUID, ShardId donorShardId) {
     return NamespaceString("config.localReshardingOplogBuffer.{}.{}"_format(
-        reshardingUUID.toString(), donorShardId.toString()));
+        existingUUID.toString(), donorShardId.toString()));
+}
+
+NamespaceString getLocalConflictStashNamespace(UUID existingUUID, ShardId donorShardId) {
+    return NamespaceString{NamespaceString::kConfigDb,
+                           "localReshardingConflictStash.{}.{}"_format(existingUUID.toString(),
+                                                                       donorShardId.toString())};
 }
 
 }  // namespace mongo

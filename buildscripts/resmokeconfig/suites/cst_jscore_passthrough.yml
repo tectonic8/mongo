@@ -135,6 +135,7 @@ selector:
   - jstests/core/explain_find_and_modify.js
   - jstests/core/explain_large_bounds.js
   - jstests/core/explain_multi_plan.js
+  - jstests/core/explain_server_params.js
   - jstests/core/explain_shell_helpers.js
   - jstests/core/explain_sort_type.js
   - jstests/core/explain_winning_plan.js
@@ -223,7 +224,6 @@ selector:
   - jstests/core/hint1.js
   - jstests/core/id1.js
   - jstests/core/idhack.js
-  - jstests/core/id_sbe.js
   - jstests/core/in.js
   - jstests/core/in2.js
   - jstests/core/in3.js
@@ -504,7 +504,6 @@ selector:
   - jstests/core/fts_trailing_fields.js
   - jstests/core/geo_2d_trailing_fields.js
   - jstests/core/idhack.js
-  - jstests/core/id_sbe.js
   - jstests/core/in7.js
   - jstests/core/index13.js
   - jstests/core/index_check2.js
@@ -692,6 +691,7 @@ selector:
   - jstests/core/geo_mindistance_boundaries.js
   - jstests/core/geo_multinest0.js
   - jstests/core/geo_multinest1.js
+  - jstests/core/geo_near_point_query.js
   - jstests/core/geo_near_random1.js
   - jstests/core/geo_near_random2.js
   - jstests/core/geo_near_tailable.js

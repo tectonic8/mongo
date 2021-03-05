@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2020 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -99,6 +99,17 @@ struct __wt_named_extractor {
     const char *name;                    /* Name of extractor */
     WT_EXTRACTOR *extractor;             /* User supplied object */
     TAILQ_ENTRY(__wt_named_extractor) q; /* Linked list of extractors */
+};
+
+/*
+ * WT_NAMED_STORAGE_SOURCE --
+ *	A storage source list entry
+ */
+struct __wt_named_storage_source {
+    const char *name;                  /* Name of storage source */
+    WT_STORAGE_SOURCE *storage_source; /* User supplied callbacks */
+    /* Linked list of compressors */
+    TAILQ_ENTRY(__wt_named_storage_source) q;
 };
 
 /*
@@ -365,6 +376,25 @@ struct __wt_connection_impl {
     const char *stat_stamp; /* Statistics log entry timestamp */
     uint64_t stat_usecs;    /* Statistics log period */
 
+    WT_SESSION_IMPL *tiered_session; /* Tiered thread session */
+    wt_thread_t tiered_tid;          /* Tiered thread */
+    bool tiered_tid_set;             /* Tiered thread set */
+    WT_CONDVAR *tiered_cond;         /* Tiered wait mutex */
+    uint64_t tiered_object_size;     /* Tiered object size */
+    uint64_t tiered_retain_secs;     /* Tiered period */
+    const char *tiered_auth_token;   /* Tiered authentication cookie */
+
+    WT_TIERED_MANAGER tiered_manager; /* Tiered worker thread information */
+    bool tiered_server_running;       /* Internal tiered server operating */
+
+    uint32_t tiered_threads_max; /* Max tiered threads */
+    uint32_t tiered_threads_min; /* Min tiered threads */
+
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define WT_CONN_TIERED_ENABLED 0x1u /* Shared tiered is configured */
+                                    /* AUTOMATIC FLAG VALUE GENERATION STOP */
+    uint32_t tiered_flags;          /* Global tiered configuration */
+
 /* AUTOMATIC FLAG VALUE GENERATION START */
 #define WT_CONN_LOG_ARCHIVE 0x001u         /* Archive is enabled */
 #define WT_CONN_LOG_CONFIG_ENABLED 0x002u  /* Logging is configured */
@@ -435,6 +465,9 @@ struct __wt_connection_impl {
 
     /* Locked: extractor list */
     TAILQ_HEAD(__wt_extractor_qh, __wt_named_extractor) extractorqh;
+
+    /* Locked: storage source list */
+    TAILQ_HEAD(__wt_storage_source_qh, __wt_named_storage_source) storagesrcqh;
 
     void *lang_private; /* Language specific private storage */
 
@@ -558,6 +591,7 @@ struct __wt_connection_impl {
 #define WT_CONN_SERVER_LSM 0x08u
 #define WT_CONN_SERVER_STATISTICS 0x10u
 #define WT_CONN_SERVER_SWEEP 0x20u
+#define WT_CONN_SERVER_TIERED 0x40u
     /* AUTOMATIC FLAG VALUE GENERATION STOP */
     uint32_t server_flags;
 

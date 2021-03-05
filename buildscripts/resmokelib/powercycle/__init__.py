@@ -11,12 +11,22 @@ import argparse
 
 from buildscripts.resmokelib.plugin import PluginInterface, Subcommand
 from buildscripts.resmokelib.powercycle import powercycle, powercycle_config, powercycle_constants
+from buildscripts.resmokelib.powercycle.remote_hang_analyzer import RunHangAnalyzerOnRemoteInstance
+from buildscripts.resmokelib.powercycle.save_diagnostics import GatherRemoteEventLogs, TarEC2Artifacts, \
+    CopyEC2Artifacts, CopyEC2MonitorFiles, GatherRemoteMongoCoredumps, CopyRemoteMongoCoredumps
+from buildscripts.resmokelib.powercycle.setup import SetUpEC2Instance
 
 SUBCOMMAND = "powercycle"
 
 
 class Powercycle(Subcommand):
     """Main class to run powercycle subcommand."""
+
+    # Parser command Enum
+    RUN = 1
+    HOST_SETUP = 2
+    SAVE_DIAG = 3
+    REMOTE_HANG_ANALYZER = 4
 
     def __init__(self, parser_actions, options):
         """Initialize."""
@@ -25,7 +35,37 @@ class Powercycle(Subcommand):
 
     def execute(self):
         """Execute powercycle test."""
+        return {
+            self.RUN: self._exec_powercycle_main, self.HOST_SETUP: self._exec_powercycle_host_setup,
+            self.SAVE_DIAG: self._exec_powercycle_save_diagnostics,
+            self.REMOTE_HANG_ANALYZER: self._exec_powercycle_hang_analyzer
+        }[self.options.run_option]()
+
+    def _exec_powercycle_main(self):
         powercycle.main(self.parser_actions, self.options)
+
+    @staticmethod
+    def _exec_powercycle_host_setup():
+        SetUpEC2Instance().execute()
+
+    @staticmethod
+    def _exec_powercycle_save_diagnostics():
+
+        # The event logs on Windows are a useful diagnostic to have when determining if something bad
+        # happened to the remote machine after it was repeatedly crashed during powercycle testing. For
+        # example, the Application and System event logs have previously revealed that the mongod.exe
+        # process abruptly exited due to not being able to open a file despite the process successfully
+        # being restarted and responding to network requests.
+        GatherRemoteEventLogs().execute()
+        TarEC2Artifacts().execute()
+        CopyEC2Artifacts().execute()
+        CopyEC2MonitorFiles().execute()
+        GatherRemoteMongoCoredumps().execute()
+        CopyRemoteMongoCoredumps().execute()
+
+    @staticmethod
+    def _exec_powercycle_hang_analyzer():
+        RunHangAnalyzerOnRemoteInstance().execute()
 
 
 class PowercyclePlugin(PluginInterface):
@@ -35,9 +75,64 @@ class PowercyclePlugin(PluginInterface):
         """Initialize."""
         self.parser_actions = None
 
+    @staticmethod
+    def _add_powercycle_commands(parent_parser):
+        """Add sub-subcommands for powercycle."""
+        sub_parsers = parent_parser.add_subparsers()
+
+        setup_parser = sub_parsers.add_parser("setup-host",
+                                              help="Step 1. Set up the host for powercycle")
+        setup_parser.set_defaults(run_option=Powercycle.HOST_SETUP)
+
+        run_parser = sub_parsers.add_parser(
+            "run", help="Step 2. Run the Powercycle test of your choice;"
+            "search for 'powercycle invocation' in evg task logs")
+        run_parser.set_defaults(run_option=Powercycle.RUN)
+
+        save_parser = sub_parsers.add_parser(
+            "save-diagnostics",
+            help="Copy Powercycle diagnostics to local machine; mainly used by Evergreen. For"
+            "local invocation, consider instead ssh-ing into the Powercycle host directly")
+        save_parser.set_defaults(run_option=Powercycle.SAVE_DIAG)
+
+        save_parser = sub_parsers.add_parser(
+            "remote-hang-analyzer",
+            help="Run the hang analyzer on the remote machine; mainly used by Evergreen")
+        save_parser.set_defaults(run_option=Powercycle.REMOTE_HANG_ANALYZER)
+
+        # Only need to return run_parser for further processing; others don't need additional args.
+        return run_parser
+
     def add_subcommand(self, subparsers):  # pylint: disable=too-many-statements
         """Create and add the parser for the subcommand."""
-        parser = subparsers.add_parser(SUBCOMMAND, help=__doc__, usage="usage")
+        intermediate_parser = subparsers.add_parser(
+            SUBCOMMAND, help=__doc__, usage="""
+MongoDB Powercycle Tests. To run a powercycle test locally, use the following steps:
+
+1. Spin up an Evergreen spawnhost or virtual workstation that supports running
+   Powercycle, e.g. by creating the host from an existing Powercycle task.
+
+2. Set up the mongo repo for development as you would locally, per Server Onboarding
+   instructions.
+
+3. Run the following command to create a new host for powercycle that is identical
+   to the one you're on:
+
+     `evergreen host create [options]`
+
+   See the command's help message for additional options, including a keyfile.
+
+4. Save the IP address of the newly created host from the previous step and store
+   it a file called `expansions.yml` in the current working directory with the key
+   `private_ip_address`. I.e.
+
+     `echo "private_ip_address: 123.45.67.89" > expansions.yml
+
+5. You're ready to run powercycle! See the help message for individual subcommands
+   for more detail.
+            """)
+
+        parser = self._add_powercycle_commands(intermediate_parser)
 
         test_options = parser.add_argument_group("Test Options")
         mongodb_options = parser.add_argument_group("MongoDB Options")
