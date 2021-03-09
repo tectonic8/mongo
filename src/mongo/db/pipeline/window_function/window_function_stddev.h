@@ -37,7 +37,7 @@ class WindowFunctionStdDev : public WindowFunctionState {
 protected:
     explicit WindowFunctionStdDev(ExpressionContext* const expCtx, bool isSamp)
         : WindowFunctionState(expCtx),
-          _sum(AccumulatorSum::create(expCtx)),
+          _mean(AccumulatorSum::create(expCtx)),
           _m2(AccumulatorSum::create(expCtx)),
           _isSamp(isSamp),
           _count(0),
@@ -49,11 +49,27 @@ public:
     }
 
     void add(Value value) {
-        update(std::move(value), +1);
+        if (accountForNonfinite(value, +1))
+            return;
+        _count++;
+        double delta = value.coerceToDouble() - _mean->getValue(false).coerceToDouble();
+        _mean->process(Value{delta / _count}, false);
+        _m2->process(Value(delta * (value.coerceToDouble() - _mean->getValue(false).coerceToDouble())), false);
     }
 
     void remove(Value value) {
-        update(std::move(value), -1);
+        if (accountForNonfinite(value, -1))
+            return;
+        if (_count == 1) {
+            reset();
+            return;
+        }
+        double val = value.coerceToDouble();
+        double old_mean = _mean->getValue(false).coerceToDouble();
+        double new_mean = (old_mean * _count - val) / (_count - 1);
+        _mean->process(Value{new_mean - old_mean}, false);
+        _m2->process(Value((new_mean - val) * (val - old_mean)), false);
+        _count--;
     }
 
     Value getValue() const final {
@@ -67,42 +83,30 @@ public:
 
     void reset() {
         _m2->reset();
-        _sum->reset();
+        _mean->reset();
         _count = 0;
         _nonfiniteValueCount = 0;
     }
 
 private:
-    void update(Value value, int quantity) {
-        // quantity should be 1 if adding value, -1 if removing value
+    // Returns true if value is nonfinite and it has been accounted for.
+    bool accountForNonfinite(Value value, int quantity) {
         if (!value.numeric())
-            return;
+            return true;
         if ((value.getType() == NumberDouble && !std::isfinite(value.getDouble())) ||
             (value.getType() == NumberDecimal && !value.getDecimal().isFinite())) {
             _nonfiniteValueCount += quantity;
             _count += quantity;
-            return;
+            return true;
         }
-
-        if (_count == 0) {  // Assuming we are adding value if _count == 0.
-            _count++;
-            _sum->process(value, false);
-            return;
-        } else if (_count + quantity == 0) {  // Empty the window.
-            reset();
-            return;
-        }
-        double x = _count * value.coerceToDouble() - _sum->getValue(false).coerceToDouble();
-        _count += quantity;
-        _sum->process(Value{value.coerceToDouble() * quantity}, false);
-        _m2->process(Value{x * x * quantity / (_count * (_count - quantity))}, false);
+        return false;
     }
 
     // Std dev cannot make use of RemovableSum because of its specific handling of non-finite
     // values. Adding a NaN or +/-inf makes the result NaN. Additionally, the consistent and
     // exclusive use of doubles in std dev calculations makes the type handling in RemovableSum
     // unnecessary.
-    boost::intrusive_ptr<AccumulatorState> _sum;
+    boost::intrusive_ptr<AccumulatorState> _mean;
     boost::intrusive_ptr<AccumulatorState> _m2;
     bool _isSamp;
     long long _count;
@@ -111,12 +115,18 @@ private:
 
 class WindowFunctionStdDevPop final : public WindowFunctionStdDev {
 public:
+    static std::unique_ptr<WindowFunctionState> create(ExpressionContext* const expCtx) {
+        return std::make_unique<WindowFunctionStdDevPop>(expCtx);
+    }
     explicit WindowFunctionStdDevPop(ExpressionContext* const expCtx)
         : WindowFunctionStdDev(expCtx, false) {}
 };
 
 class WindowFunctionStdDevSamp final : public WindowFunctionStdDev {
 public:
+    static std::unique_ptr<WindowFunctionState> create(ExpressionContext* const expCtx) {
+        return std::make_unique<WindowFunctionStdDevSamp>(expCtx);
+    }
     explicit WindowFunctionStdDevSamp(ExpressionContext* const expCtx)
         : WindowFunctionStdDev(expCtx, true) {}
 };

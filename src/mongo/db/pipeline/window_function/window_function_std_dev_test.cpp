@@ -197,5 +197,22 @@ TEST_F(WindowFunctionStdDevTest, LargeNumberStability) {
     }
 }
 
+TEST_F(WindowFunctionStdDevTest, HandlesUnderflow) {
+    const int collLength = 10000;
+    const int windowSize = 100;
+    PseudoRandom prng(0);
+    std::vector<double> vec(collLength);
+    for (int j = 0; j < collLength; j++) {
+        vec[j] = prng.nextCanonicalDouble() - 0.5;
+    }
+    for (int i=0; i < collLength/windowSize; i++) {
+        for (int j = 0; j < windowSize; j++) pop.add(Value{vec[i*windowSize + j]});
+        for (int k = 0; k < windowSize - 1; k++) pop.remove(Value{vec[i*windowSize + k]});
+        ASSERT_VALUE_EQ(pop.getValue(), Value{0});
+        pop.remove(Value{vec[i*windowSize + (windowSize - 1)]}); 
+        ASSERT_VALUE_EQ(pop.getValue(), Value{BSONNULL});
+    }
+}
+
 }  // namespace
 }  // namespace mongo
